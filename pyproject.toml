@@ -1,7 +1,7 @@
 [project]
 name = "loro"
 version = "0.1.0"
-description = "LangGraph harness for dubbing English videos into Vietnamese"
+description = "A video dubbing pipeline (English to Vietnamese by default), core on local models"
 readme = "README.md"
 license = { text = "MIT" }
 authors = [{ name = "Vinh Nguyen" }]

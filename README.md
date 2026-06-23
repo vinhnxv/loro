@@ -1,6 +1,6 @@
 # Loro 🦜
 
-A LangGraph dubbing harness for video (ASR and TTS local or cloud, with the core
+A dubbing pipeline for video (ASR and TTS local or cloud, with the core
 running on local models). By default it dubs **English into Vietnamese**, but the
 target language is now selectable per run (see [Multi-language dubbing](#multi-language-dubbing)):
 ASR (Soniox cloud by default, or AssemblyAI cloud, or Nemotron local) → translation
@@ -30,7 +30,7 @@ ingest ─┬─► asr ──► sentence_seg ─┬─► [crosscheck*] ──
 | `mux` | Mix the dub with the original audio (duck to 15% or replace entirely); deliver the target subtitles **three ways**: a toggleable soft-sub (default), a sidecar `.<tag>.srt` next to the video, and an **optional hard burn-in** (`--burn-subs`, re-encodes the video) | ffmpeg |
 
 The `asr → sentence_seg` branch and the `vision` branch run **in parallel** from
-`ingest` (LangGraph fan-out/fan-in). With the `local` ASR engine, `crosscheck`
+`ingest` (fan-out/fan-in). With the `local` ASR engine, `crosscheck`
 waits on both before `voice_ref`; with a cloud engine (`soniox`/`assemblyai`)
 there is no `crosscheck`, so `voice_ref` waits directly on `sentence_seg` + `vision`
 (vision still runs to feed scene context into the translation). The dub is built
@@ -446,7 +446,7 @@ rule. No node edits are required.
 
 ## Reference tools (surveyed)
 
-There's no off-the-shelf LangGraph dubbing harness — the pipelines below are
+There's no off-the-shelf tool that does this end-to-end — the pipelines below are
 monolithic apps, but their techniques informed this design:
 
 - [pyvideotrans](https://github.com/jianchang512/pyvideotrans) — modular ASR →
@@ -477,7 +477,7 @@ monolithic apps, but their techniques informed this design:
   voice — the current pool rotation can mis-cast gender)
 - [ ] Demucs background separation, mixing the dub over clean background music
 - [ ] A translation reflect/QA step (VideoLingo-style) with Gemma
-- [ ] LangGraph checkpointer (SQLite) to resume long pipelines
+- [ ] Checkpointer (SQLite) to resume long pipelines
 - [ ] Tier-1 calibration of the FR/ES CPS/rate/tolerance constants from real runs;
   CJK/RTL target support (the profile carries `script`/`segmentation_rule` for it)
 
