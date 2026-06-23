@@ -1,6 +1,7 @@
 """CLI lifecycle: exit codes and report behavior of loro.__main__.main()."""
 
 import json
+import logging
 
 import pytest
 
@@ -247,6 +248,18 @@ def test_burn_subs_flag_sets_config(env):
 def test_burn_subs_absent_defaults_false(env):
     cfg = _capture_cfg(env, [])
     assert cfg.subtitle_burn is False
+
+
+def test_verbose_deepens_only_loro_logger(env):
+    # -v puts loro's own loggers at DEBUG, but must NOT flip the root logger to
+    # DEBUG: third-party libraries (urllib3/openai/httpcore) would then dump
+    # base64 audio request/response bodies, bloating the log to hundreds of KB
+    # per line. Regression guard for that fix.
+    ok = lambda s: {"output_path": "o", "srt_src": "a", "srt_target": "b"}
+    env["run"](ok, ["-v"])
+    assert logging.getLogger("loro").level == logging.DEBUG
+    env["run"](ok, [])
+    assert logging.getLogger("loro").level == logging.INFO
 
 
 def test_lock_loss_exits_one_without_touching_report(env):

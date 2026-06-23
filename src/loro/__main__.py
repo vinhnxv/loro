@@ -64,11 +64,16 @@ def main() -> None:
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
 
+    # Root stays at INFO so third-party libraries (urllib3, openai, httpcore, ...)
+    # never emit their DEBUG records — at -v those dump base64 audio request/response
+    # bodies, which bloats the log to hundreds of KB per line and makes it unusable.
+    # -v deepens only loro's own loggers to DEBUG.
     logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
+        level=logging.INFO,
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
         datefmt="%H:%M:%S",
     )
+    logging.getLogger("loro").setLevel(logging.DEBUG if args.verbose else logging.INFO)
 
     # --tts-engine/--asr-engine win over their env vars; when unset, leave each
     # field to its env-reading default_factory rather than overriding it with None.
