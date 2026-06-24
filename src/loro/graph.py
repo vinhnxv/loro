@@ -80,6 +80,13 @@ def build_graph(cfg: Config, timings: dict[str, float] | None = None):
 
     # The downstream head waits on vision's keyword list (R31) when present; it
     # is crosscheck on the local engine, otherwise voice_ref directly.
+    #
+    # Single-writer-after-join contract (R13/A1/KTD6): the parallel branches joined
+    # here write DISJOINT keys — sentence_seg -> segments, vision ->
+    # video_context/video_keywords — and everything after the head is a linear
+    # chain, so exactly one writer touches `segments` at a time and last-writer-wins
+    # is safe. state.single_writer_merge is the fail-loud reducer to wire if a
+    # second concurrent `segments` writer is ever introduced (deferred until then).
     head = "crosscheck" if include_crosscheck else "voice_ref"
     if cfg.enable_vision:
         g.add_edge(["sentence_seg", "vision"], head)
