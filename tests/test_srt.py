@@ -244,6 +244,24 @@ def test_wrapped_target_emits_no_zero_duration_block_when_words_collapse():
         assert c.end > c.start
 
 
+# --- U14/B11: per-language target-cue budget keeps VI byte-identical (R19) ---
+
+def test_vi_target_render_uses_global_budget_unchanged():
+    # The VI target render at the per-language derived budget must be byte-identical
+    # to the legacy global-budget render: VI's budget IS the global, so subtitle
+    # bytes never move (the key VI regression guard for U14).
+    cfg = Config()  # VI default
+    seg = Segment(index=0, start=0.0, end=10.0, text_src="x",
+                  text_target=" ".join(f"từ{i}" for i in range(40)))
+    derived = srt.to_srt_wrapped([seg], side="target",
+                                 max_chars=cfg.srt_target_max_cue_chars,
+                                 max_dur=cfg.srt_max_cue_dur)
+    legacy = srt.to_srt_wrapped([seg], side="target",
+                                max_chars=cfg.srt_max_cue_chars,
+                                max_dur=cfg.srt_max_cue_dur)
+    assert derived == legacy
+
+
 def test_no_cross_check_path_writes_wrapped_en_srt(tmp_path):
     from loro.nodes.crosscheck import crosscheck
     seg, words = _en_segment(count=30)

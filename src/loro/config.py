@@ -640,6 +640,30 @@ class Config:
         return self.tts_max_chunk_syllables if p.length_model == "syllable" else p.chunk_budget
 
     @property
+    def srt_target_max_cue_chars(self) -> int:
+        """Per-language target-cue char budget for SRT tiling (U14/B11).
+
+        VI (syllable model) keeps the global `srt_max_cue_chars` so its subtitle
+        bytes are byte-identical (R19). CPS profiles take the TIGHTER of the global
+        cap and a reading-speed-derived ceiling — `cps_max` chars/sec over a
+        full-length cue (`srt_max_cue_dur`): a cue should not exceed cps_max*dur
+        characters or it reads too fast.
+
+        SURFACED INERT (B11 precondition): every shipped CPS profile carries
+        cps_max=17.0, and 17.0 * srt_max_cue_dur(6.0) = 102 >= the global
+        srt_max_cue_chars(84), so the global is binding and this is currently a
+        no-op for FR/ES — the call sites now read the profile budget, but making
+        R14 bite needs calibrated (lower, <~14) per-language cps_max values (a
+        deferred follow-up). The min() also guarantees the wiring can only ever
+        TIGHTEN, never loosen cues past today's default while values are
+        uncalibrated. Read at every target-SRT call site (translate/mux-burn/tts)
+        so the measured-loop re-render can never silently revert it."""
+        p = self.language_profile
+        if p.length_model == "syllable":
+            return self.srt_max_cue_chars
+        return min(self.srt_max_cue_chars, int(p.cps_max * self.srt_max_cue_dur))
+
+    @property
     def measured_duration_active(self) -> bool:
         """Is the measured-clip-duration-vs-slot length gate active (U6)? On for
         the CPS profiles (non-VI), off for the VI syllable model — so the whole

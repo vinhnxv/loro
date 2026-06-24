@@ -439,7 +439,7 @@ def translate(state: DubState, cfg: Config) -> DubState:
     srt_target = workdir / f"transcript.{tgt_tag}.srt"
     srt_target.write_text(
         srt.to_srt_wrapped(segments, words, side="target",
-                           max_chars=cfg.srt_max_cue_chars, max_dur=cfg.srt_max_cue_dur),
+                           max_chars=cfg.srt_target_max_cue_chars, max_dur=cfg.srt_max_cue_dur),
         encoding="utf-8")
     log.info("target SRT -> %s", srt_target)
     return {"segments": segments, "srt_target": str(srt_target)}

@@ -102,6 +102,11 @@ def mux(state: DubState, cfg: Config) -> DubState:
     # font/margins, or the encoder profile all rebuild the output (R8).
     force_style = (_burn_force_style(ffmpeg.probe_video_height(video), profile.font)
                    if cfg.subtitle_burn else "")
+    # Effective burned-cue char budget: the tighter of the burn cap and the
+    # per-language target budget (U14). 42 (the burn cap) binds today; a calibrated
+    # CPS profile can only tighten it. Folded into the fingerprint so that change
+    # rebuilds the burn — unchanged at the shipped values, so no spurious rebuild.
+    burn_max_chars = min(cfg.srt_burn_max_cue_chars, cfg.srt_target_max_cue_chars)
 
     marker = workdir / "mux.json"
     inputs = {
@@ -112,7 +117,7 @@ def mux(state: DubState, cfg: Config) -> DubState:
         "srt_sha": artifacts.file_sha256(state["srt_target"]),
         "output_path": str(output),
         "subtitle_burn": cfg.subtitle_burn,
-        "srt_burn_max_cue_chars": cfg.srt_burn_max_cue_chars,
+        "srt_burn_max_cue_chars": burn_max_chars,
         "burn_force_style": force_style,
         "encoder": BURN_ENCODER if cfg.subtitle_burn else "copy",
         # The tail-duration policy shapes the output, so it is part of its
@@ -156,7 +161,7 @@ def mux(state: DubState, cfg: Config) -> DubState:
         burn_srt = workdir / f"transcript.{tag}.burn.srt"
         burn_srt.write_text(
             srt.to_srt_wrapped(state["segments"], state.get("words") or [], side="target",
-                               max_chars=cfg.srt_burn_max_cue_chars, max_dur=cfg.srt_max_cue_dur),
+                               max_chars=burn_max_chars, max_dur=cfg.srt_max_cue_dur),
             encoding="utf-8")
         sub = ffmpeg.escape_filter_path(burn_srt)
         # Point libass at the bundled fonts dir so the profile font resolves even
