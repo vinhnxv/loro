@@ -12,12 +12,21 @@ import shutil
 import uuid
 from pathlib import Path
 
+import numpy as np
+import soundfile as sf
+
 from loro.config import Config
 from loro.harness import artifacts
 from loro.state import DubState
 from loro.utils import ffmpeg, srt
 
 log = logging.getLogger("loro.mux")
+
+# Output-duration policy version, folded into the mux fingerprint (U3). Bump it
+# whenever the tail-duration logic changes, so an output cached under the prior
+# policy is invalidated and rebuilt once. 1 = pre-U3 (-shortest cut any dub
+# spill at the video length); 2 = U3 (run to max(video, real dub tail)).
+MUX_DURATION_POLICY = 2
 
 # Fallback burn font when the profile names none. libass resolves a font by name
 # via fontconfig; the profile supplies the per-language name + glyph sample, and
@@ -63,6 +72,21 @@ def _write_sidecar(output: Path, srt_target: str, tag: str) -> Path:
     return sidecar
 
 
+def _dub_content_end(dub_wav: str | Path, threshold: float = 1e-4) -> float:
+    """Seconds at which the dub's audio actually ends — its last non-silent
+    sample, not its file length (U3/R2). `fit` always pads the timeline to
+    video_duration + 1.0s of headroom, so the file length over-reports the real
+    tail; mux runs the output to max(video, this) so a clip that legitimately
+    spilled past video_duration is kept while a normal dub gains no trailing
+    silence. An all-silent dub (every segment skipped in duck mode) returns 0.0,
+    so the output runs to the video length."""
+    audio, sr = sf.read(str(dub_wav), dtype="float32", always_2d=False)
+    if audio.ndim > 1:
+        audio = audio.mean(axis=1)
+    nz = np.nonzero(np.abs(audio) > threshold)[0]
+    return (int(nz[-1]) + 1) / sr if len(nz) else 0.0
+
+
 def mux(state: DubState, cfg: Config) -> DubState:
     video = Path(state["video_path"])
     workdir = Path(state["workdir"])
@@ -91,6 +115,9 @@ def mux(state: DubState, cfg: Config) -> DubState:
         "srt_burn_max_cue_chars": cfg.srt_burn_max_cue_chars,
         "burn_force_style": force_style,
         "encoder": BURN_ENCODER if cfg.subtitle_burn else "copy",
+        # The tail-duration policy shapes the output, so it is part of its
+        # identity: changing it rebuilds the muxed file (U3/R2/R8).
+        "duration_policy": MUX_DURATION_POLICY,
     }
     if artifacts.is_valid(marker, inputs):
         recorded = json.loads(marker.read_text(encoding="utf-8"))
@@ -101,13 +128,23 @@ def mux(state: DubState, cfg: Config) -> DubState:
             log.info("output reused -> %s", output)
             return {"output_path": str(output), "srt_sidecar": str(sidecar)}
 
+    # Output duration policy (U3/R2): run the muxed output to the real dub tail —
+    # max(video, where the dub audio actually ends) — instead of -shortest, which
+    # cut any clip that legitimately spilled past video_duration. Using the dub's
+    # real content end (not fit's padded file length) keeps the standard case
+    # (dub within the video) byte-for-byte the video duration, with no appended
+    # headroom silence.
+    out_dur = max(ffmpeg.probe_duration(video), _dub_content_end(state["dub_wav"]))
+
     # srt_target stays input 2, mapped only via -map 2:s for the soft track. The
     # duck audio mix is `[0:a]volume[bg];[1:a][bg]amix[aout]`; replace just
     # passes the dub through. When burning, both audio and the [0:v]->subtitles
-    # video branch share one filter_complex (KTD4) so the graph carries both.
+    # video branch share one filter_complex (KTD4) so the graph carries both. The
+    # duck mix runs to the LONGEST input (duration=longest) so the dub's spilled
+    # tail is mixed in past the original audio's end, not cut at it (U3).
     if cfg.original_audio == "duck":
         audio_branch = (f"[0:a]volume={cfg.duck_volume}[bg];"
-                        "[1:a][bg]amix=inputs=2:duration=first:normalize=0[aout]")
+                        "[1:a][bg]amix=inputs=2:duration=longest:normalize=0[aout]")
     else:  # replace (skip slots already carry original audio from fit, R23)
         audio_branch = "[1:a]anull[aout]"
 
@@ -144,7 +181,10 @@ def mux(state: DubState, cfg: Config) -> DubState:
     args += [
         "-map", "2:s", *video_codec, "-c:a", "aac", "-b:a", "192k",
         "-c:s", "mov_text", "-metadata:s:s:0", f"language={profile.iso639_2}",
-        "-shortest", str(tmp_out),
+        # Cap (not pad) the output at the dub tail: -t lets the dub spill past the
+        # video without re-encoding/padding the copied video branches, and trims
+        # the +1.0s headroom in the normal case (replaces -shortest, U3/R2).
+        "-t", f"{out_dur:.3f}", str(tmp_out),
     ]
     try:
         ffmpeg.ffmpeg(*args)

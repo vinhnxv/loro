@@ -11,6 +11,7 @@ from loro.nodes import fit as fit_mod
 from loro.nodes.fit import fit
 from loro.nodes.mux import mux
 from loro.state import Segment
+from loro.utils import ffmpeg
 
 
 def _tone(path, seconds, sr=24000, freq=440.0):
@@ -370,6 +371,30 @@ class TestMux:
         result = mux(state, Config())
         assert (tmp_path / "out.vi.mp4").exists()
         assert result["output_path"] == str(tmp_path / "out.vi.mp4")
+
+    def test_dub_longer_than_video_keeps_full_tail(self, tmp_path, tiny_video):
+        # U3/R2: a dub that spills past the 2s video must not be truncated to the
+        # video length — the output audio runs to the dub tail (~3s).
+        state = self._state(tmp_path, tiny_video)
+        _tone(state["dub_wav"], 3.0)             # 3s dub over a 2s video
+        mux(state, Config())
+        out = tmp_path / "out.vi.mp4"
+        assert ffmpeg.probe_duration(out) == pytest.approx(3.0, abs=0.2)
+
+    def test_dub_within_video_keeps_video_duration(self, tmp_path, tiny_video):
+        # U3 regression: standard case (dub <= video) output duration is the video
+        # duration, with no appended +1.0s headroom silence.
+        state = self._state(tmp_path, tiny_video)      # 2s dub, 2s video
+        mux(state, Config())
+        out = tmp_path / "out.vi.mp4"
+        assert ffmpeg.probe_duration(out) == pytest.approx(2.0, abs=0.2)
+
+    def test_replace_mode_keeps_dub_tail(self, tmp_path, tiny_video):
+        state = self._state(tmp_path, tiny_video)
+        _tone(state["dub_wav"], 3.0)
+        mux(state, Config(original_audio="replace"))
+        out = tmp_path / "out.vi.mp4"
+        assert ffmpeg.probe_duration(out) == pytest.approx(3.0, abs=0.2)
 
     def test_changed_subtitles_remux(self, tmp_path, tiny_video):
         state = self._state(tmp_path, tiny_video)

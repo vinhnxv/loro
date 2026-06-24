@@ -4,7 +4,9 @@ mux was previously exercised only end-to-end via test_graph_integration. Here
 ffmpeg is faked (the real binary never runs) so we can assert on the sidecar
 behaviour and the constructed argument list directly."""
 
+import numpy as np
 import pytest
+import soundfile as sf
 
 from pathlib import Path
 
@@ -21,8 +23,10 @@ def mux_env(tmp_path, monkeypatch):
     video.write_bytes(b"\x00" * 64)
     workdir = tmp_path / "work"
     workdir.mkdir()
+    # A real (1s) wav so mux's _dub_content_end can read the dub tail; the video
+    # stays a stub because ffmpeg/ffprobe are faked below.
     dub = workdir / "dub.wav"
-    dub.write_bytes(b"\x00" * 32)
+    sf.write(str(dub), (0.3 * np.sin(2 * np.pi * 440 * np.linspace(0, 1.0, 24000))).astype("float32"), 24000)
     srt_target = workdir / "transcript.vi.srt"
     srt_target.write_text("1\n00:00:00,000 --> 00:00:01,000\nXin chào\n", encoding="utf-8")
 
@@ -34,6 +38,9 @@ def mux_env(tmp_path, monkeypatch):
         Path(args[-1]).write_bytes(b"FAKEMP4")  # the tmp output path is last
 
     monkeypatch.setattr(ffmpeg, "ffmpeg", fake_ffmpeg)
+    # The video is a stub, so fake the duration probe mux now calls for the
+    # tail-duration policy (U3); the real probe is exercised in test_fit::TestMux.
+    monkeypatch.setattr(ffmpeg, "probe_duration", lambda p: 2.0)
 
     def state(output_path=None):
         s = {"video_path": str(video), "workdir": str(workdir),
@@ -104,6 +111,35 @@ def test_default_branch_is_stream_copy_no_subtitles_filter(mux_env):
     args = mux_env["calls"]["args"]
     assert args[args.index("-c:v") + 1] == "copy"
     assert not any("subtitles=" in a for a in args)
+
+
+# --- U3: tail-duration policy (B2/R2) ---
+
+def test_tail_duration_replaces_shortest_with_explicit_limit(mux_env):
+    # -shortest is gone; the output is capped with -t at max(video, dub tail).
+    mux(mux_env["state"](), Config())
+    args = mux_env["calls"]["args"]
+    assert "-shortest" not in args
+    assert "-t" in args
+    # video probe (2.0) dominates the 1s dub here, so -t == 2.000
+    assert args[args.index("-t") + 1] == "2.000"
+
+
+def test_duck_mix_runs_to_longest(mux_env):
+    mux(mux_env["state"](), Config(original_audio="duck"))
+    fc = mux_env["calls"]["args"][mux_env["calls"]["args"].index("-filter_complex") + 1]
+    assert "amix=inputs=2:duration=longest" in fc
+
+
+def test_duration_policy_change_rebuilds_output(mux_env, monkeypatch):
+    state = mux_env["state"]()
+    mux(state, Config())
+    assert mux_env["calls"]["count"] == 1
+    mux(state, Config())                                   # same policy -> cache hit
+    assert mux_env["calls"]["count"] == 1
+    monkeypatch.setattr(mux_mod, "MUX_DURATION_POLICY", 999)  # policy in fingerprint
+    mux(state, Config())                                   # changed -> rebuild
+    assert mux_env["calls"]["count"] == 2
 
 
 # --- U3: opt-in hard burn-in (--burn-subs) ---
