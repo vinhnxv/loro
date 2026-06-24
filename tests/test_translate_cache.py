@@ -463,6 +463,23 @@ class TestProgrammerErrorPropagation:
         # one infra call per batch (2 batches), no per-segment retry storm
         assert len(env["sent"]) == 2
 
+    def test_malformed_object_reply_is_content_skip_not_crash(self, env, monkeypatch):
+        # A reply that wraps the array in an OBJECT (or mis-keys items) is a model
+        # output-shape (content) failure, not a programmer bug: _translate_lines
+        # classifies it as content, so it degrades to a per-segment skip instead of
+        # crashing the run with a TypeError.
+        def wrapper(cfg, messages, **kw):
+            env["sent"].append(messages)
+            user = messages[-1]["content"]
+            lines = json.loads(user[user.rindex("[{"):])
+            return json.dumps({"translations": [{"i": l["i"], "vi": f"x{l['i']}"}
+                                                 for l in lines]})
+        monkeypatch.setattr(tr.llm, "chat", wrapper)
+        result = _run(env, abort_threshold=99)        # must NOT raise
+        assert result["segments"][0].skipped
+        entry = SkipLedger(env["workdir"]).entries()["seg_0000"]
+        assert entry["signature"][1] == "content"     # not a propagated crash
+
     def test_empty_string_translation_records_content_skip(self, env, monkeypatch):
         # Regression: a valid-shape reply with empty translations raises the
         # explicit "no translation returned" ValueError -> recorded as content.

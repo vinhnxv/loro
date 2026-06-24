@@ -45,6 +45,18 @@ def _clip_sha(path: str) -> str:
     return artifacts.cached_file_sha256(path)
 
 
+def _clip_duration(path: str | Path) -> float:
+    """Wav clip duration from the header only — no ffprobe subprocess — for the
+    per-call overrun reprobe (U4). The reprobe runs for every interior segment on
+    EVERY fit() call (including cache-hit reruns), so an ffprobe fork per segment
+    is a real cost on long videos; the soundfile header read is microseconds. TTS
+    clips are always wav, and frames/samplerate agrees with build's
+    ffmpeg.probe_duration to far within the wide fit_overflow_tolerance band, so
+    the overrun decision is unchanged."""
+    info = sf.info(str(path))
+    return info.frames / info.samplerate
+
+
 def _read_mono_at(path: str | Path, sr: int, scratch: Path) -> np.ndarray:
     audio, file_sr = sf.read(str(path), dtype="float32", always_2d=False)
     if audio.ndim > 1:
@@ -104,6 +116,10 @@ def _record_overruns(segments: list[Segment], video_duration: float,
     audio; the last clip spills into trailing silence that mux preserves (no
     drop). A CPS segment already carrying a best-effort length_overflow stays
     exit-0 and is never promoted here (KTD2)."""
+    # Snapshot the ledger once (entries() copies the dict); the per-segment KTD2
+    # check reads its own pre-call status, which this loop's record/clear for a
+    # DIFFERENT segment never mutates.
+    existing = ledger.entries()
     for i, seg in enumerate(segments):
         sid = segment_id(seg)
         record = False
@@ -112,14 +128,14 @@ def _record_overruns(segments: list[Segment], video_duration: float,
         if seg.tts_wav and not seg.skipped and i + 1 < len(segments):
             slot = _slot_end(segments, i, video_duration) - seg.start
             if slot > 0:
-                clip_dur = ffmpeg.probe_duration(seg.tts_wav)
+                clip_dur = _clip_duration(seg.tts_wav)
                 if clip_dur > slot:
                     capped = clip_dur / min(clip_dur / slot, cfg.max_tempo)
                     # capped > slot * tol: the cap couldn't fit it and the interior
                     # trim dropped a material tail. The wide band keeps a normal
                     # few-percent post-cap overrun from being exit-2 noise (KTD7).
                     record = capped > slot * cfg.fit_overflow_tolerance
-        if record and ledger.entries().get(sid, {}).get("status") != "length_overflow":
+        if record and existing.get(sid, {}).get("status") != "length_overflow":
             ledger.record_fit_overflow(sid)
         else:
             # No overrun (or a CPS length_overflow we must not promote): drop any

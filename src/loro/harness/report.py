@@ -212,7 +212,11 @@ def write_report(workdir: str | Path, report: dict) -> Path:
 
 
 def exit_code(report: dict) -> int:
-    """0 clean; 2 completed with skips/accepted-skips; 3 aborted; 1 fatal (R25)."""
+    """0 clean; 2 completed with skips/accepted-skips OR placement-layer
+    fit_overflows (U4/R3 — a dub clip materially overran its slot and was
+    trimmed); 3 aborted; 1 fatal (R25). A degraded auto-LID detection
+    (asr_lid_degraded) is a caveat, not corruption, so it does NOT raise the exit
+    code on its own — callers must read report.json for it."""
     if report["status"] == "aborted":
         return 3
     if report["status"] == "failed":

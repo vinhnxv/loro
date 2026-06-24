@@ -144,6 +144,16 @@ def test_non_auto_run_writes_no_lid_marker(state, monkeypatch):
     assert not (Path(state["workdir"]) / "asr" / "lid.json").exists()
 
 
+def test_non_auto_run_clears_stale_lid_marker(state, monkeypatch):
+    # An earlier auto run leaves a degraded marker; a later non-auto run on the
+    # same workdir must clear it, never leave a stale agent-facing signal.
+    _mock_transcribe(monkeypatch)        # CANNED has no per-token language field
+    asr_mod.asr(state, _cfg(source_lang="auto"))
+    assert (Path(state["workdir"]) / "asr" / "lid.json").exists()
+    asr_mod.asr(state, _cfg())           # non-auto rerun, same workdir
+    assert not (Path(state["workdir"]) / "asr" / "lid.json").exists()
+
+
 def test_maps_tokens_to_words_in_seconds_with_speaker(state, monkeypatch):
     # R2/R3/R4: tokens -> words, ms -> s, joined word text, speaker captured.
     _mock_transcribe(monkeypatch)

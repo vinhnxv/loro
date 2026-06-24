@@ -257,7 +257,10 @@ video, changing a prompt) invalidates only the affected part.
 - **Reporting**: at the end of every run (including an abort), `report.json` + a
   console summary list the skips, cross-check text replacements, low-confidence
   segments, and per-stage durations.
-- **Exit codes**: `0` clean, `2` completed with skips, `3` aborted, `1` fatal.
+- **Exit codes**: `0` clean, `2` completed with skips or placement-layer
+  fit_overflows (a dub clip overran its slot after the tempo cap and was trimmed),
+  `3` aborted, `1` fatal. Inspect `report.json` (`fit_overflows` vs `skipped`) to
+  tell them apart — retrying heals skips, not fit_overflows.
 
 ```bash
 .venv/bin/python -m pytest tests/   # unit + integration tests (offline, mocked models)

@@ -44,6 +44,12 @@ STAGE = "asr"
 # with an opaque 4xx (KTD3/U2). ~8000 tokens * 4 chars/token.
 CONTEXT_CHAR_CAP = 8000 * 4
 
+# Minimum back-off (seconds) after a TRANSIENT poll failure, so a persistent
+# 5xx/connection flood never hot-spins a degraded server even when the normal
+# poll_interval is configured to 0 (U5 hardening). The normal processing cadence
+# is unchanged — this floor applies only after a caught transient.
+_POLL_TRANSIENT_BACKOFF = 1.0
+
 
 def _headers(cfg: Config) -> dict:
     return {"Authorization": f"Bearer {cfg.soniox_api_key}"}
@@ -164,6 +170,7 @@ def _poll(cfg: Config, transcription_id: str, duration: float) -> None:
     url = f"{cfg.soniox_stt_base_url}/v1/transcriptions/{transcription_id}"
     while True:
         status = None
+        transient = False
         try:
             resp = requests.get(url, headers=_headers(cfg),
                                 timeout=cfg.soniox_stt_request_timeout)
@@ -173,9 +180,11 @@ def _poll(cfg: Config, transcription_id: str, duration: float) -> None:
         except StageError as exc:
             if exc.error_class != INFRA:
                 raise  # 4xx / content (e.g. bad key) -> fail fast, no retry
+            transient = True
             log.warning("Soniox STT poll transient error (%s) — continuing to poll "
                         "within the %.0fs budget", exc.code, budget)
         except RequestException as exc:
+            transient = True
             log.warning("Soniox STT poll connection error (%s) — continuing to poll "
                         "within the %.0fs budget", type(exc).__name__, budget)
         else:
@@ -187,7 +196,10 @@ def _poll(cfg: Config, transcription_id: str, duration: float) -> None:
         if time.monotonic() >= deadline:
             raise StageError(STAGE, INFRA, "poll_timeout",
                              f"status={status!r} after {budget:.0f}s budget")
-        time.sleep(cfg.soniox_stt_poll_interval)
+        # After a transient failure, back off at least _POLL_TRANSIENT_BACKOFF so a
+        # persistent flood doesn't hammer a degraded server at poll_interval=0.
+        time.sleep(max(cfg.soniox_stt_poll_interval, _POLL_TRANSIENT_BACKOFF)
+                   if transient else cfg.soniox_stt_poll_interval)
 
 
 def _fetch_transcript(cfg: Config, transcription_id: str) -> dict:

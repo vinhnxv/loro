@@ -119,17 +119,19 @@ class SkipLedger:
 
     LENGTH_OVERFLOW_SIGNATURE = ("tts", "length", "length_overflow")
 
-    def record_length_overflow(self, segment_id: str) -> None:
-        """Record a best-effort length overflow (U6/R7): a non-VI clip that could
-        not fit its slot even after the convergence cap. The clip is KEPT (the
-        segment is NOT skipped), so this is a report annotation, not a failure —
-        it stores a `length_overflow` entry and pushes a PRE-DEMOTED window entry,
-        so it can never count toward the abort threshold (the loop's iteration is
-        expected, not infra degradation)."""
-        sig = list(self.LENGTH_OVERFLOW_SIGNATURE)
+    def _record_non_fatal_overflow(self, segment_id: str, status: str,
+                                   signature: tuple[str, str, str]) -> None:
+        """Shared body for the two non-fatal, PRE-DEMOTED overflow records
+        (length_overflow / fit_overflow): the clip is KEPT (the segment is NOT
+        skipped), so this is a report annotation, not a failure. It stores the
+        entry (reason == status) and pushes a pre-demoted window entry so the
+        loop's expected iterations can never count toward the abort threshold. The
+        status + signature discriminate the two records; the bookkeeping is
+        identical, kept in one place so a fix (e.g. demoted=True) can't drift."""
+        sig = list(signature)
         self._segments[segment_id] = {
-            "status": "length_overflow",
-            "reason": "length_overflow",
+            "status": status,
+            "reason": status,
             "signature": sig,
             "strikes": 0,
             "input_hash": "",
@@ -137,6 +139,16 @@ class SkipLedger:
         }
         self._push_window({"segment_id": segment_id, "signature": sig, "demoted": True})
         self._save()
+
+    def record_length_overflow(self, segment_id: str) -> None:
+        """Record a best-effort length overflow (U6/R7): a non-VI clip that could
+        not fit its slot even after the convergence cap. The clip is KEPT (the
+        segment is NOT skipped), so this is a report annotation, not a failure —
+        it stores a `length_overflow` entry and pushes a PRE-DEMOTED window entry,
+        so it can never count toward the abort threshold (the loop's iteration is
+        expected, not infra degradation)."""
+        self._record_non_fatal_overflow(segment_id, "length_overflow",
+                                        self.LENGTH_OVERFLOW_SIGNATURE)
 
     FIT_OVERFLOW_SIGNATURE = ("fit", "length", "fit_overflow")
 
@@ -153,17 +165,8 @@ class SkipLedger:
         skipped). Like record_length_overflow it stores the entry and pushes a
         PRE-DEMOTED window entry, so recurring overruns on speed-constrained
         content can never accumulate toward the abort threshold (ledger.py)."""
-        sig = list(self.FIT_OVERFLOW_SIGNATURE)
-        self._segments[segment_id] = {
-            "status": "fit_overflow",
-            "reason": "fit_overflow",
-            "signature": sig,
-            "strikes": 0,
-            "input_hash": "",
-            "demoted": True,
-        }
-        self._push_window({"segment_id": segment_id, "signature": sig, "demoted": True})
-        self._save()
+        self._record_non_fatal_overflow(segment_id, "fit_overflow",
+                                        self.FIT_OVERFLOW_SIGNATURE)
 
     def clear_fit_overflow(self, segment_id: str) -> None:
         """Drop a stale fit_overflow entry when a recompute no longer overruns, so

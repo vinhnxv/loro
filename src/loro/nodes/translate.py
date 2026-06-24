@@ -153,7 +153,20 @@ def _translate_lines(cfg: Config, profile, lines: list[dict],
     )
     items = llm.extract_json(reply)
     key = profile.output_key
-    result = {int(item["i"]): str(item[key]).strip() for item in items}
+    # extract_json can return a list OR a dict (a model that wraps the array in an
+    # object), and a list item can be the wrong type or mis-keyed. That is a model
+    # OUTPUT-shape failure (CONTENT), not a programmer error — classify it as a
+    # content StageError so the batch/per-segment handlers record it as a skip,
+    # rather than the U8 narrowing letting a malformed-but-parseable reply crash
+    # the run. A genuine bug in OUR code stays outside this guard and propagates.
+    if not isinstance(items, list):
+        raise StageError("translate", "content", "bad_shape",
+                         f"expected a JSON array, got {type(items).__name__}")
+    try:
+        result = {int(item["i"]): str(item[key]).strip() for item in items}
+    except (KeyError, TypeError, ValueError) as exc:
+        raise StageError("translate", "content", "bad_shape",
+                         f"malformed translation item: {exc}") from exc
     # A truncated reply (e.g. a leaked <think> ate max_tokens, KTD6) silently
     # drops indices. Surface it as a content error so the missing segments are
     # retried/strike-counted instead of falling quietly to translate_failed (U6).

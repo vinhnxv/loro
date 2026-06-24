@@ -214,6 +214,10 @@ class SonioxAsrProvider:
             _write_lid_marker(asr_dir, source_lang, lid_degraded)
         else:
             source_lang = cfg.source_lang
+            # Clear any stale marker a prior --source-lang auto run left on this
+            # workdir, so the report never shows a degraded-LID signal for a run
+            # that did not use auto detection.
+            _write_lid_marker(asr_dir, source_lang, False)
 
         words = _group_soniox_tokens(raw.get("tokens") or [])
         if not words:

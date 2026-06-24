@@ -3,8 +3,11 @@
     loro input.mp4 [-o output.mp4] [--no-vision] [--no-cross-check]
                    [--no-seg-visual] [--no-summary] [--original-audio duck|replace]
 
-Exit codes (R25): 0 completed clean; 2 completed with skipped or
-accepted-skipped segments; 3 aborted (systemic failure signature); 1 fatal.
+Exit codes (R25): 0 completed clean; 2 completed with skipped/accepted-skipped
+segments OR placement-layer fit_overflows (a dub clip materially overran its slot
+and was trimmed, U4); 3 aborted (systemic failure signature); 1 fatal. Callers
+that remediate should branch on report.json (report["fit_overflows"] vs
+report["skipped"]), not the exit code alone — retrying does not heal a fit_overflow.
 """
 
 import argparse

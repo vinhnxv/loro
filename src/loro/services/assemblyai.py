@@ -33,6 +33,12 @@ log = logging.getLogger("loro.assemblyai")
 
 STAGE = "asr"
 
+# Minimum back-off (seconds) after a TRANSIENT poll failure, so a persistent
+# 5xx/connection flood never hot-spins a degraded server even when the normal
+# poll_interval is configured to 0 (U5 hardening). The normal processing cadence
+# is unchanged — this floor applies only after a caught transient.
+_POLL_TRANSIENT_BACKOFF = 1.0
+
 
 def _headers(cfg: Config) -> dict:
     # AssemblyAI uses the raw key in `authorization` (no "Bearer" prefix).
@@ -109,6 +115,7 @@ def _poll(cfg: Config, transcript_id: str, duration: float) -> dict:
     url = f"{cfg.assemblyai_base_url}/transcript/{transcript_id}"
     while True:
         status = None
+        transient = False
         try:
             resp = requests.get(url, headers=_headers(cfg),
                                 timeout=cfg.assemblyai_request_timeout)
@@ -118,9 +125,11 @@ def _poll(cfg: Config, transcript_id: str, duration: float) -> dict:
         except StageError as exc:
             if exc.error_class != INFRA:
                 raise  # 4xx / content (e.g. bad key) -> fail fast, no retry
+            transient = True
             log.warning("AssemblyAI poll transient error (%s) — continuing to poll "
                         "within the %.0fs budget", exc.code, budget)
         except RequestException as exc:
+            transient = True
             log.warning("AssemblyAI poll connection error (%s) — continuing to poll "
                         "within the %.0fs budget", type(exc).__name__, budget)
         else:
@@ -132,7 +141,10 @@ def _poll(cfg: Config, transcript_id: str, duration: float) -> dict:
         if time.monotonic() >= deadline:
             raise StageError(STAGE, INFRA, "poll_timeout",
                              f"status={status!r} after {budget:.0f}s budget")
-        time.sleep(cfg.assemblyai_poll_interval)
+        # After a transient failure, back off at least _POLL_TRANSIENT_BACKOFF so a
+        # persistent flood doesn't hammer a degraded server at poll_interval=0.
+        time.sleep(max(cfg.assemblyai_poll_interval, _POLL_TRANSIENT_BACKOFF)
+                   if transient else cfg.assemblyai_poll_interval)
 
 
 def transcribe(cfg: Config, audio_path: str | Path) -> dict:

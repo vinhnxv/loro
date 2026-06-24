@@ -295,8 +295,10 @@ def test_sub_tolerance_overrun_does_not_record(tmp_path):
 def test_overrun_recorded_on_cache_hit_rerun(tmp_path):
     wd = tmp_path / "wd"
     wd.mkdir()
-    long0 = wd / "c0.wav"; _tone(long0, 3.0)
-    clip1 = wd / "c1.wav"; _tone(clip1, 0.8)
+    long0 = wd / "c0.wav"
+    _tone(long0, 3.0)
+    clip1 = wd / "c1.wav"
+    _tone(clip1, 0.8)
 
     def make():
         return {"segments": [
@@ -326,8 +328,10 @@ def test_fit_overflow_is_mode_independent(tmp_path):
     def make(name, mode):
         wd = tmp_path / name
         wd.mkdir()
-        long0 = wd / "c0.wav"; _tone(long0, 3.0)
-        clip1 = wd / "c1.wav"; _tone(clip1, 0.8)
+        long0 = wd / "c0.wav"
+        _tone(long0, 3.0)
+        clip1 = wd / "c1.wav"
+        _tone(clip1, 0.8)
         st = {"segments": [
             Segment(index=0, start=0.0, end=1.0, text_src="a", text_target="a", tts_wav=str(long0)),
             Segment(index=1, start=1.0, end=2.0, text_src="b", text_target="b", tts_wav=str(clip1)),
@@ -357,8 +361,10 @@ def test_cps_length_overflow_not_promoted_to_fit_overflow(tmp_path):
 def test_recompute_without_overrun_clears_stale_fit_overflow(tmp_path):
     wd = tmp_path / "wd"
     wd.mkdir()
-    c0 = wd / "c0.wav"; _tone(c0, 3.0)
-    c1 = wd / "c1.wav"; _tone(c1, 0.8)
+    c0 = wd / "c0.wav"
+    _tone(c0, 3.0)
+    c1 = wd / "c1.wav"
+    _tone(c1, 0.8)
 
     def make(clip0):
         return {"segments": [
@@ -369,7 +375,8 @@ def test_recompute_without_overrun_clears_stale_fit_overflow(tmp_path):
     cfg = Config(max_tempo=1.35, fit_overflow_tolerance=1.5)
     fit(make(str(c0)), cfg)
     assert _fit_overflows(str(wd)) == {"seg_0000"}
-    short = wd / "short.wav"; _tone(short, 0.5)        # now fits its slot
+    short = wd / "short.wav"                            # now fits its slot
+    _tone(short, 0.5)
     fit(make(str(short)), cfg)
     assert _fit_overflows(str(wd)) == set()            # stale entry cleared
 

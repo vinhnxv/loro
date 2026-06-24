@@ -165,6 +165,26 @@ class TestGraniteDtype:
         assert used == "float32"               # degraded, not crashed
         assert calls == ["float16", "float32"]  # tried preferred, then fell back
 
+    def test_load_model_falls_back_on_typeerror(self):
+        # _load_model catches (RuntimeError, TypeError); a transformers version
+        # raising TypeError on the dtype kwarg must also trigger the fallback.
+        calls = []
+
+        class FakeModel:
+            def to(self, device):
+                return self
+
+        class FakeCls:
+            def from_pretrained(self, model_id, dtype=None, low_cpu_mem_usage=None):
+                calls.append(dtype)
+                if dtype == "float16":
+                    raise TypeError("unexpected keyword argument 'dtype'")
+                return FakeModel()
+
+        model, used = gw._load_model(FakeCls(), "id", "mps", "float16", "float32")
+        assert used == "float32"
+        assert calls == ["float16", "float32"]
+
     def test_load_model_keeps_preferred_dtype_when_supported(self):
         class FakeModel:
             def to(self, device):

@@ -58,6 +58,9 @@ def http(monkeypatch, tmp_path):
     fake = _FakeHTTP()
     monkeypatch.setattr(aai, "requests", fake)
     monkeypatch.setattr(aai.ffmpeg, "probe_duration", lambda p: 5.0)
+    # No real delays: the poll loop's transient back-off floor would otherwise add
+    # real wall-clock to the transient-then-success tests (U5 hardening).
+    monkeypatch.setattr(aai.time, "sleep", lambda *_: None)
     audio = tmp_path / "audio.wav"
     audio.write_bytes(b"RIFFfake-wav-bytes")
     fake.audio = audio
