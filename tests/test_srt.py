@@ -203,6 +203,47 @@ def test_wrapped_vi_fewer_words_than_cues_stays_monotone_in_span():
         prev = c.start
 
 
+# --- U1/B1/B12: SRT writer rejects negative timestamps + zero-duration cues (R4) ---
+
+def test_fmt_time_clamps_negative_to_zero():
+    assert srt.fmt_time(-0.5) == "00:00:00,000"
+    # even a large negative never leaks a leading "-" field
+    assert "-" not in srt.fmt_time(-3661.042)
+
+
+def test_fmt_time_zero_and_positive_unchanged():
+    # regression: the clamp must not move any valid time
+    assert srt.fmt_time(0.0) == "00:00:00,000"
+    assert srt.fmt_time(3661.042) == "01:01:01,042"
+
+
+def test_render_cues_drops_zero_duration_cue_and_renumbers():
+    rendered = srt._render_cues([
+        srt.Cue(1.0, 1.0, "degenerate"),
+        srt.Cue(1.0, 2.0, "real"),
+    ])
+    assert "degenerate" not in rendered
+    assert "real" in rendered
+    assert "00:00:01,000 --> 00:00:01,000" not in rendered
+    # the surviving cue is renumbered to a contiguous 1, not left as 2
+    assert rendered.startswith("1\n")
+
+
+def test_wrapped_target_emits_no_zero_duration_block_when_words_collapse():
+    # All covered EN words end exactly at seg.start, so the target tiler maps the
+    # early cue groups to start == end (zero-duration) before the span opens up to
+    # seg.end. Those degenerate blocks must be dropped on write, never emitted.
+    seg = Segment(index=0, start=5.0, end=10.0, text_src="x",
+                  text_target=" ".join(f"aa{i}" for i in range(12)))
+    words = [{"start": 5.0, "end": 5.0, "word": f"w{i}"} for i in range(4)]
+    out = srt.to_srt_wrapped([seg], words, side="target", max_chars=6, max_dur=6.0)
+    assert "00:00:05,000 --> 00:00:05,000" not in out
+    cues = srt.parse_cues(out)
+    assert cues                              # at least one real cue survives
+    for c in cues:
+        assert c.end > c.start
+
+
 def test_no_cross_check_path_writes_wrapped_en_srt(tmp_path):
     from loro.nodes.crosscheck import crosscheck
     seg, words = _en_segment(count=30)
