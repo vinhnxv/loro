@@ -21,7 +21,8 @@ import soundfile as sf
 
 from loro.config import Config
 from loro.harness import artifacts
-from loro.state import DubState, Segment
+from loro.harness.ledger import SkipLedger
+from loro.state import DubState, Segment, segment_id
 from loro.utils import ffmpeg
 
 log = logging.getLogger("loro.fit")
@@ -86,6 +87,44 @@ def _place(timeline: np.ndarray, audio: np.ndarray, at: float, sr: int) -> None:
     end = min(offset + len(audio), len(timeline))
     if end > offset:
         timeline[offset:end] += audio[: end - offset]
+
+
+def _record_overruns(segments: list[Segment], video_duration: float,
+                     ledger: SkipLedger, cfg: Config) -> None:
+    """Record/clear a placement-layer `fit_overflow` per segment (U4/R3/KTD7).
+
+    Called OUTSIDE the cached `build` (artifacts.produce skips build on a cache
+    hit — exactly the resumed run where a VI clip overran and the run still
+    exited 0), so the overrun decision is re-derived on EVERY fit() call from the
+    segment geometry, not gated on a rebuild. It is computable without the built
+    timeline (so it works identically on a cache hit and under both --original-
+    audio duck and replace): a clip overruns iff, after the max_tempo cap, its
+    length still exceeds slot * fit_overflow_tolerance. Only INTERIOR clips
+    qualify — U2 trims their spilled tail at the next segment's onset, dropping
+    audio; the last clip spills into trailing silence that mux preserves (no
+    drop). A CPS segment already carrying a best-effort length_overflow stays
+    exit-0 and is never promoted here (KTD2)."""
+    for i, seg in enumerate(segments):
+        sid = segment_id(seg)
+        record = False
+        # A skipped/clipless segment, and the last segment (tail spills into
+        # genuine trailing silence), can never have dropped audio.
+        if seg.tts_wav and not seg.skipped and i + 1 < len(segments):
+            slot = _slot_end(segments, i, video_duration) - seg.start
+            if slot > 0:
+                clip_dur = ffmpeg.probe_duration(seg.tts_wav)
+                if clip_dur > slot:
+                    capped = clip_dur / min(clip_dur / slot, cfg.max_tempo)
+                    # capped > slot * tol: the cap couldn't fit it and the interior
+                    # trim dropped a material tail. The wide band keeps a normal
+                    # few-percent post-cap overrun from being exit-2 noise (KTD7).
+                    record = capped > slot * cfg.fit_overflow_tolerance
+        if record and ledger.entries().get(sid, {}).get("status") != "length_overflow":
+            ledger.record_fit_overflow(sid)
+        else:
+            # No overrun (or a CPS length_overflow we must not promote): drop any
+            # stale fit_overflow; clear_fit_overflow leaves other statuses intact.
+            ledger.clear_fit_overflow(sid)
 
 
 def fit(state: DubState, cfg: Config) -> DubState:
@@ -189,4 +228,10 @@ def fit(state: DubState, cfg: Config) -> DubState:
     dub_wav = fit_dir / f"dub.{cfg.target_lang.lower()}.wav"
     cached = artifacts.produce(dub_wav, inputs, "fit", build)
     log.info("dub track %s -> %s", "reused" if cached else "built", dub_wav)
+
+    # Surface placement-layer length overruns in the ledger on EVERY call,
+    # independent of the cache hit above, so a resumed run still reports them and
+    # raises the exit code (U4/R3).
+    _record_overruns(segments, video_duration,
+                     SkipLedger.from_cfg(workdir, cfg), cfg)
     return {"segments": segments, "dub_wav": str(dub_wav)}

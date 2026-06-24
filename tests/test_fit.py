@@ -7,6 +7,7 @@ import soundfile as sf
 
 from loro.config import Config
 from loro.harness import artifacts
+from loro.harness.ledger import SkipLedger
 from loro.nodes import fit as fit_mod
 from loro.nodes.fit import fit
 from loro.nodes.mux import mux
@@ -250,6 +251,127 @@ def test_fit_overflow_tolerance_change_busts_dub_cache(tmp_path):
     assert artifacts.read_meta(tmp_path / "fit" / "dub.vi.wav")["input_fingerprint"] == fp1
     fit(make(), Config(fit_overflow_tolerance=2.0))          # changed -> rebuild
     assert artifacts.read_meta(tmp_path / "fit" / "dub.vi.wav")["input_fingerprint"] != fp1
+
+
+# --- U4: placement-layer overrun -> ledger fit_overflow + exit 2 (B2/R3/KTD7) ---
+
+def _fit_overflows(workdir):
+    return {k for k, v in SkipLedger(workdir).entries().items()
+            if v["status"] == "fit_overflow"}
+
+
+def _two_seg_state(tmp_path, name, clip0_dur, seg1_skipped=False):
+    # seg 0 is INTERIOR (followed by seg 1) with a 1.0s slot; an over-cap clip0
+    # has its tail trimmed at seg 1's onset (U2).
+    wd = tmp_path / name
+    wd.mkdir()
+    long0 = wd / "c0.wav"
+    _tone(long0, clip0_dur)
+    s0 = Segment(index=0, start=0.0, end=1.0, text_src="a", text_target="a", tts_wav=str(long0))
+    if seg1_skipped:
+        s1 = Segment(index=1, start=1.0, end=2.0, text_src="b", skipped=True, skip_reason="qa")
+    else:
+        clip1 = wd / "c1.wav"
+        _tone(clip1, 0.8)
+        s1 = Segment(index=1, start=1.0, end=2.0, text_src="b", text_target="b", tts_wav=str(clip1))
+    return {"segments": [s0, s1], "workdir": str(wd), "video_duration": 2.0}
+
+
+def test_over_tolerance_overrun_records_fit_overflow(tmp_path):
+    # 3.0s clip in a 1.0s slot: capped at 1.35 -> 2.22x slot > 1.5x tolerance.
+    state = _two_seg_state(tmp_path, "a", clip0_dur=3.0)
+    fit(state, Config(max_tempo=1.35, fit_overflow_tolerance=1.5))
+    assert _fit_overflows(state["workdir"]) == {"seg_0000"}
+
+
+def test_sub_tolerance_overrun_does_not_record(tmp_path):
+    # 1.5s clip in a 1.0s slot: capped -> 1.11x slot, below the 1.5x band -> the
+    # tail is trimmed but it is NOT exit-2 signal (KTD7).
+    state = _two_seg_state(tmp_path, "a", clip0_dur=1.5)
+    fit(state, Config(max_tempo=1.35, fit_overflow_tolerance=1.5))
+    assert _fit_overflows(state["workdir"]) == set()
+
+
+def test_overrun_recorded_on_cache_hit_rerun(tmp_path):
+    wd = tmp_path / "wd"
+    wd.mkdir()
+    long0 = wd / "c0.wav"; _tone(long0, 3.0)
+    clip1 = wd / "c1.wav"; _tone(clip1, 0.8)
+
+    def make():
+        return {"segments": [
+            Segment(index=0, start=0.0, end=1.0, text_src="a", text_target="a", tts_wav=str(long0)),
+            Segment(index=1, start=1.0, end=2.0, text_src="b", text_target="b", tts_wav=str(clip1)),
+        ], "workdir": str(wd), "video_duration": 2.0}
+
+    cfg = Config(max_tempo=1.35, fit_overflow_tolerance=1.5)
+    fit(make(), cfg)
+    dub = wd / "fit" / "dub.vi.wav"
+    sha = artifacts.file_sha256(dub)
+    (wd / "skips.json").unlink()                      # wipe the recorded overrun
+    fit(make(), cfg)                                  # dub is a cache hit
+    assert artifacts.file_sha256(dub) == sha          # build was NOT re-run
+    assert _fit_overflows(str(wd)) == {"seg_0000"}    # yet the overrun re-records
+
+
+def test_over_cap_clip_with_skipped_neighbor_still_records(tmp_path):
+    # KTD7: the gate keys on dropped audio (geometry), not neighbor occupancy —
+    # a duck-mode skipped neighbor (empty slot) does not let the overrun off.
+    state = _two_seg_state(tmp_path, "a", clip0_dur=3.0, seg1_skipped=True)
+    fit(state, Config(max_tempo=1.35, original_audio="duck", fit_overflow_tolerance=1.5))
+    assert _fit_overflows(state["workdir"]) == {"seg_0000"}
+
+
+def test_fit_overflow_is_mode_independent(tmp_path):
+    def make(name, mode):
+        wd = tmp_path / name
+        wd.mkdir()
+        long0 = wd / "c0.wav"; _tone(long0, 3.0)
+        clip1 = wd / "c1.wav"; _tone(clip1, 0.8)
+        st = {"segments": [
+            Segment(index=0, start=0.0, end=1.0, text_src="a", text_target="a", tts_wav=str(long0)),
+            Segment(index=1, start=1.0, end=2.0, text_src="b", text_target="b", tts_wav=str(clip1)),
+        ], "workdir": str(wd), "video_duration": 2.0}
+        if mode == "replace":
+            st["audio_orig"] = str(_orig_audio(wd))
+        return st, wd
+
+    duck, dwd = make("duck", "duck")
+    fit(duck, Config(max_tempo=1.35, original_audio="duck", fit_overflow_tolerance=1.5))
+    repl, rwd = make("repl", "replace")
+    fit(repl, Config(max_tempo=1.35, original_audio="replace", fit_overflow_tolerance=1.5))
+    assert _fit_overflows(str(dwd)) == _fit_overflows(str(rwd)) == {"seg_0000"}
+
+
+def test_cps_length_overflow_not_promoted_to_fit_overflow(tmp_path):
+    # KTD2: a CPS segment already carrying an exit-0 length_overflow must not be
+    # back-door-promoted to exit-2 by the placement layer.
+    state = _two_seg_state(tmp_path, "a", clip0_dur=3.0)
+    SkipLedger(state["workdir"]).record_length_overflow("seg_0000")
+    fit(state, Config(max_tempo=1.35, fit_overflow_tolerance=1.5))
+    entries = SkipLedger(state["workdir"]).entries()
+    assert entries["seg_0000"]["status"] == "length_overflow"  # not promoted
+    assert _fit_overflows(state["workdir"]) == set()
+
+
+def test_recompute_without_overrun_clears_stale_fit_overflow(tmp_path):
+    wd = tmp_path / "wd"
+    wd.mkdir()
+    c0 = wd / "c0.wav"; _tone(c0, 3.0)
+    c1 = wd / "c1.wav"; _tone(c1, 0.8)
+
+    def make(clip0):
+        return {"segments": [
+            Segment(index=0, start=0.0, end=1.0, text_src="a", text_target="a", tts_wav=str(clip0)),
+            Segment(index=1, start=1.0, end=2.0, text_src="b", text_target="b", tts_wav=str(c1)),
+        ], "workdir": str(wd), "video_duration": 2.0}
+
+    cfg = Config(max_tempo=1.35, fit_overflow_tolerance=1.5)
+    fit(make(str(c0)), cfg)
+    assert _fit_overflows(str(wd)) == {"seg_0000"}
+    short = wd / "short.wav"; _tone(short, 0.5)        # now fits its slot
+    fit(make(str(short)), cfg)
+    assert _fit_overflows(str(wd)) == set()            # stale entry cleared
 
 
 def _orig_audio(tmp_path, seconds=4.0, sr=44100):

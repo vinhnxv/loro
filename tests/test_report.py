@@ -130,6 +130,22 @@ class TestExitCode:
         assert rp.exit_code(rp.build_report(tmp_path, status="aborted")) == 3
         assert rp.exit_code(rp.build_report(tmp_path, status="failed")) == 1
 
+    def test_fit_overflow_gives_two(self, tmp_path):
+        # U4/R3: a placement-layer overrun raises the exit code even on an
+        # otherwise-clean run.
+        SkipLedger(tmp_path).record_fit_overflow("seg_0019")
+        report = rp.build_report(tmp_path)
+        assert "seg_0019" in report["fit_overflows"]
+        assert rp.exit_code(report) == 2
+
+    def test_length_overflow_alone_stays_exit_zero(self, tmp_path):
+        # KTD2: a CPS best-effort length_overflow is surfaced but does NOT change
+        # the exit code, unlike fit_overflow.
+        SkipLedger(tmp_path).record_length_overflow("seg_0003")
+        report = rp.build_report(tmp_path)
+        assert report["length_overflows"] and not report["fit_overflows"]
+        assert rp.exit_code(report) == 0
+
 
 class TestConsoleSummary:
     def test_summary_mentions_everything(self, tmp_path):
@@ -149,3 +165,9 @@ class TestConsoleSummary:
     def test_clean_summary(self, tmp_path):
         text = rp.console_summary(rp.build_report(tmp_path))
         assert "No segments were skipped" in text
+
+    def test_summary_lists_fit_overflow(self, tmp_path):
+        SkipLedger(tmp_path).record_fit_overflow("seg_0019")
+        text = rp.console_summary(rp.build_report(tmp_path))
+        assert "Fit overflow" in text
+        assert "seg_0019" in text

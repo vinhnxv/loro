@@ -147,6 +147,11 @@ def build_report(
     # exit code).
     length_overflows = {k: v for k, v in entries.items()
                         if v["status"] == "length_overflow"}
+    # Placement-layer overruns (U4/R3): a clip that materially overran its slot
+    # after the tempo cap and had its spilled tail trimmed (dub audio dropped).
+    # Distinct from length_overflow — this DOES drive exit code 2.
+    fit_overflows = {k: v for k, v in entries.items()
+                     if v["status"] == "fit_overflow"}
     crosscheck = _crosscheck_report(workdir, valid_ids)
 
     # Language-run config (R22/agent-legibility, #14): which language pair ran and
@@ -172,6 +177,7 @@ def build_report(
         "skipped": skipped,
         "accepted_skips": accepted,
         "length_overflows": length_overflows,
+        "fit_overflows": fit_overflows,
         "crosscheck_replacements": crosscheck["replacements"],
         "crosscheck_low_confidence": crosscheck["low_confidence"],
         "crosscheck_sub_rejected": crosscheck["sub_rejected"],
@@ -195,7 +201,7 @@ def exit_code(report: dict) -> int:
         return 3
     if report["status"] == "failed":
         return 1
-    if report["skipped"] or report["accepted_skips"]:
+    if report["skipped"] or report["accepted_skips"] or report.get("fit_overflows"):
         return 2
     return 0
 
@@ -224,6 +230,13 @@ def console_summary(report: dict) -> str:
         lines.append(f"Length overflow ({len(overflows)}) — clips kept best-effort, "
                      "could not fit slot:")
         for seg in sorted(overflows):
+            lines.append(f"  - {seg}")
+
+    fit_overflows = report.get("fit_overflows") or {}
+    if fit_overflows:
+        lines.append(f"Fit overflow ({len(fit_overflows)}) — clip materially overran "
+                     "its slot after the tempo cap; spilled dub audio was trimmed:")
+        for seg in sorted(fit_overflows):
             lines.append(f"  - {seg}")
 
     summary = report.get("crosscheck_summary")

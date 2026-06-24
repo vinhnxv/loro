@@ -138,6 +138,43 @@ class SkipLedger:
         self._push_window({"segment_id": segment_id, "signature": sig, "demoted": True})
         self._save()
 
+    FIT_OVERFLOW_SIGNATURE = ("fit", "length", "fit_overflow")
+
+    def record_fit_overflow(self, segment_id: str) -> None:
+        """Record a PLACEMENT-layer length overrun (U4/R3): a clip that still
+        exceeded its slot after the max_tempo cap and had its spilled tail trimmed
+        at the next segment's onset (fit, U2), so dub audio was actually dropped.
+
+        Unlike `length_overflow` — which is CPS-only (measured_duration_active is
+        False for VI), deliberately exit-0, and means "best-effort CPS clip kept
+        after the re-translation cap" — `fit_overflow` runs for all languages and
+        DOES drive exit code 2, so the operator/orchestrating agent sees that a
+        dub clip was materially cut. The clip is still KEPT (the segment is NOT
+        skipped). Like record_length_overflow it stores the entry and pushes a
+        PRE-DEMOTED window entry, so recurring overruns on speed-constrained
+        content can never accumulate toward the abort threshold (ledger.py)."""
+        sig = list(self.FIT_OVERFLOW_SIGNATURE)
+        self._segments[segment_id] = {
+            "status": "fit_overflow",
+            "reason": "fit_overflow",
+            "signature": sig,
+            "strikes": 0,
+            "input_hash": "",
+            "demoted": True,
+        }
+        self._push_window({"segment_id": segment_id, "signature": sig, "demoted": True})
+        self._save()
+
+    def clear_fit_overflow(self, segment_id: str) -> None:
+        """Drop a stale fit_overflow entry when a recompute no longer overruns, so
+        a fixed segment doesn't keep the run at exit 2 (U4). Only clears a
+        fit_overflow entry — it never erases a real skip or a CPS length_overflow
+        for the same id — and only writes when it actually removed one."""
+        entry = self._segments.get(segment_id)
+        if entry is not None and entry["status"] == "fit_overflow":
+            self._segments.pop(segment_id, None)
+            self._save()
+
     def record_strike(self, signature: tuple[str, str, str]) -> None:
         """Window-only strike for failures that never skip (cross-check, R8/R20)."""
         self._push_window({"segment_id": None, "signature": list(signature), "demoted": False})
