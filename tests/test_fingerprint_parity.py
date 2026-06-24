@@ -314,6 +314,22 @@ _STUB_WORKER = textwrap.dedent('''
 ''')
 
 
+def test_assemblyai_pinned_code_fingerprint_invariant_to_detection(tmp_path, monkeypatch):
+    # B4/R7/KTD5: a pinned language_code drops language_detection from the
+    # fingerprint (mirroring the request), so the two toggles hash identically.
+    monkeypatch.setattr(assemblyai, "transcribe", lambda cfg, a: _ASSEMBLYAI_RESPONSE)
+
+    def fp(detection):
+        state, _ = _asr_state(tmp_path / f"d{int(detection)}")
+        asr_mod.asr(state, Config(asr_engine="assemblyai", assemblyai_api_key="k",
+                                  assemblyai_language_code="en",
+                                  assemblyai_language_detection=detection))
+        return artifacts.read_meta(
+            tmp_path / f"d{int(detection)}" / "asr" / "assemblyai.json")["input_fingerprint"]
+
+    assert fp(True) == fp(False)
+
+
 def test_local_asr_window_and_merge_inputs_golden(tmp_path, monkeypatch):
     worker = tmp_path / "stub_worker.py"
     worker.write_text(_STUB_WORKER)

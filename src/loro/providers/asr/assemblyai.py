@@ -52,9 +52,17 @@ class AssemblyaiAsrProvider:
             "engine": "assemblyai",
             "speech_models": cfg.assemblyai_speech_models,
             "speaker_labels": cfg.assemblyai_speaker_labels,
-            "language_detection": cfg.assemblyai_language_detection,
             "language_code": cfg.assemblyai_language_code,
         }
+        # Mirror the request branch in services/assemblyai._create exactly
+        # (B4/R7/KTD5): the request sends language_code XOR language_detection, so
+        # a pinned code OMITS language_detection from the request — and the
+        # fingerprint must omit it too. Otherwise toggling detection on a pinned
+        # run changes the cache key for an identical request, forcing a needless
+        # recompute and re-bill. The unpinned (detection) path is unchanged, so the
+        # default fingerprint stays byte-identical.
+        if not cfg.assemblyai_language_code:
+            inputs["language_detection"] = cfg.assemblyai_language_detection
         # Cache the raw API response so a resumed/re-run job never re-uploads or
         # re-pays (R6/KTD8); transcribe() is only called when stale.
         raw = artifacts.produce_json(

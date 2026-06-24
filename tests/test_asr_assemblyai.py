@@ -115,6 +115,30 @@ def test_cached_transcript_not_refetched(state, monkeypatch):
     assert calls["n"] == 1
 
 
+# --- U7: pinned-language fingerprint must not re-bill on a detection toggle ---
+
+def test_pinned_code_fingerprint_invariant_to_detection_toggle(state, monkeypatch):
+    # B4/R7: with language_code pinned the request omits language_detection, so
+    # toggling it is an identical request -> a cache HIT, no second transcribe.
+    calls = _mock_transcribe(monkeypatch)
+    asr_mod.asr(state, _cfg(assemblyai_language_code="en",
+                            assemblyai_language_detection=True))
+    assert calls["n"] == 1
+    asr_mod.asr(state, _cfg(assemblyai_language_code="en",
+                            assemblyai_language_detection=False))
+    assert calls["n"] == 1  # cache hit: not re-billed
+
+
+def test_unpinned_fingerprint_still_varies_with_detection(state, monkeypatch):
+    # With no pinned code, language_detection genuinely changes the request and so
+    # stays in the fingerprint: a toggle recomputes.
+    calls = _mock_transcribe(monkeypatch)
+    asr_mod.asr(state, _cfg(assemblyai_language_detection=True))
+    assert calls["n"] == 1
+    asr_mod.asr(state, _cfg(assemblyai_language_detection=False))
+    assert calls["n"] == 2  # different request -> recompute
+
+
 def test_dispatch_local_never_calls_cloud_client(state, monkeypatch):
     # Selecting local routes to its provider via the registry (U5); the
     # AssemblyAI client is never constructed.
