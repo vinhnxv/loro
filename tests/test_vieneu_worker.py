@@ -56,6 +56,46 @@ def _run(tmp_path, requests, extra_env=None):
     return proc, lines
 
 
+def _run_raw(tmp_path, stdin_text):
+    """Like _run but sends RAW stdin text, so a deliberately malformed (non-JSON)
+    line can be exercised (U10)."""
+    stub_dir = tmp_path / "stub"
+    stub_dir.mkdir(exist_ok=True)
+    (stub_dir / "vieneu.py").write_text(STUB_VIENEU)
+    env = {**os.environ,
+           "PYTHONPATH": os.pathsep.join(
+               [str(stub_dir), os.environ.get("PYTHONPATH", "")]).strip(os.pathsep)}
+    proc = subprocess.run(
+        [sys.executable, str(WORKER)], input=stdin_text,
+        capture_output=True, text=True, env=env, timeout=60,
+    )
+    lines = [json.loads(line) for line in proc.stdout.splitlines() if line.strip()]
+    return proc, lines
+
+
+# --- U10: a malformed stdin line must not kill the warm worker (B13/R10) ---
+
+def test_malformed_json_line_skipped_then_valid_served(tmp_path):
+    out = tmp_path / "clip.wav"
+    valid = json.dumps({"text": "ok", "out": str(out),
+                        "temperature": 0.8, "emotion": "natural"})
+    proc, lines = _run_raw(tmp_path, "this is not json\n" + valid + "\n")
+    assert lines[0] == {"status": "ready"}
+    assert lines[1] == {"out": str(out), "status": "ok"}  # bad line skipped, valid served
+    assert proc.returncode == 0                            # model stayed loaded
+
+
+def test_json_line_missing_out_skipped_then_valid_served(tmp_path):
+    out = tmp_path / "clip.wav"
+    missing_out = json.dumps({"text": "no out field", "temperature": 0.8})
+    valid = json.dumps({"text": "ok", "out": str(out),
+                        "temperature": 0.8, "emotion": "natural"})
+    proc, lines = _run_raw(tmp_path, missing_out + "\n" + valid + "\n")
+    assert lines[0] == {"status": "ready"}
+    assert {"out": str(out), "status": "ok"} in lines     # the valid request was served
+    assert proc.returncode == 0
+
+
 def test_ready_emitted_once_before_any_request(tmp_path):
     proc, lines = _run(tmp_path, [])
     assert lines == [{"status": "ready"}]
