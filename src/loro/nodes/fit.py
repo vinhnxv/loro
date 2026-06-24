@@ -34,6 +34,13 @@ log = logging.getLogger("loro.fit")
 # 2 = U2 (interior over-cap spill trimmed at the next segment's onset).
 PLACEMENT_POLICY = 2
 
+# Trailing silence padded onto the timeline past video_duration. The LAST clip is
+# never trimmed at an onset, so it may spill into this headroom (mux preserves it,
+# U3/R2); beyond it _place clamps the tail at the timeline end and audio is
+# dropped. Shared by build (timeline sizing) and _record_overruns (the last-clip
+# overrun gate) so the two never disagree on how much spill is recoverable.
+TAIL_HEADROOM_SEC = 1.0
+
 
 def _slot_end(segments: list[Segment], i: int, video_duration: float) -> float:
     if i + 1 < len(segments):
@@ -47,12 +54,12 @@ def _clip_sha(path: str) -> str:
 
 def _clip_duration(path: str | Path) -> float:
     """Wav clip duration from the header only — no ffprobe subprocess — for the
-    per-call overrun reprobe (U4). The reprobe runs for every interior segment on
-    EVERY fit() call (including cache-hit reruns), so an ffprobe fork per segment
-    is a real cost on long videos; the soundfile header read is microseconds. TTS
-    clips are always wav, and frames/samplerate agrees with build's
-    ffmpeg.probe_duration to far within the wide fit_overflow_tolerance band, so
-    the overrun decision is unchanged."""
+    per-call overrun reprobe (U4) on a CACHE HIT, where build did not run and so
+    left no probed duration to reuse. The reprobe runs for every clip on such a
+    fit() call, so an ffprobe fork per segment would be a real cost on long
+    videos; the soundfile header read is microseconds. TTS clips are always wav,
+    and frames/samplerate agrees with build's ffmpeg.probe_duration to far within
+    the fit_overflow_tolerance band, so the overrun decision is unchanged."""
     info = sf.info(str(path))
     return info.frames / info.samplerate
 
@@ -102,45 +109,54 @@ def _place(timeline: np.ndarray, audio: np.ndarray, at: float, sr: int) -> None:
 
 
 def _record_overruns(segments: list[Segment], video_duration: float,
-                     ledger: SkipLedger, cfg: Config) -> None:
-    """Record/clear a placement-layer `fit_overflow` per segment (U4/R3/KTD7).
+                     ledger: SkipLedger, cfg: Config,
+                     built_durations: dict[str, float] | None = None) -> None:
+    """Reconcile the run's placement-layer `fit_overflow` set in ONE write
+    (U4/R3/KTD7).
 
     Called OUTSIDE the cached `build` (artifacts.produce skips build on a cache
     hit — exactly the resumed run where a VI clip overran and the run still
     exited 0), so the overrun decision is re-derived on EVERY fit() call from the
     segment geometry, not gated on a rebuild. It is computable without the built
     timeline (so it works identically on a cache hit and under both --original-
-    audio duck and replace): a clip overruns iff, after the max_tempo cap, its
-    length still exceeds slot * fit_overflow_tolerance. Only INTERIOR clips
-    qualify — U2 trims their spilled tail at the next segment's onset, dropping
-    audio; the last clip spills into trailing silence that mux preserves (no
-    drop). A CPS segment already carrying a best-effort length_overflow stays
-    exit-0 and is never promoted here (KTD2)."""
-    # Snapshot the ledger once (entries() copies the dict); the per-segment KTD2
-    # check reads its own pre-call status, which this loop's record/clear for a
-    # DIFFERENT segment never mutates.
-    existing = ledger.entries()
+    audio duck and replace). `built_durations` carries the clip durations build
+    already probed on a rebuild, so a fresh run does not re-read every clip header;
+    a cache hit (build skipped) falls back to the soundfile header read.
+
+    Two geometries drop audio:
+    - INTERIOR clip: U2 trims its spilled tail at the next segment's onset,
+      dropping (capped - slot). Flagged when capped > slot * fit_overflow_tolerance
+      (a material post-cap overrun; the band keeps a normal few-percent overrun off
+      exit 2, KTD7).
+    - LAST clip: never trimmed at an onset — it spills into the timeline's trailing
+      headroom and is clamped at its end, so audio is dropped only when the capped
+      clip exceeds slot + TAIL_HEADROOM_SEC (the headroom mux can still preserve).
+
+    A CPS segment already carrying a best-effort length_overflow stays exit-0 and
+    is never promoted here (KTD2); the reconcile drops stale fit_overflows whose
+    clip now fits."""
+    overflow_ids: set[str] = set()
     for i, seg in enumerate(segments):
+        if not seg.tts_wav or seg.skipped:
+            continue
+        slot = _slot_end(segments, i, video_duration) - seg.start
+        if slot <= 0:
+            continue
         sid = segment_id(seg)
-        record = False
-        # A skipped/clipless segment, and the last segment (tail spills into
-        # genuine trailing silence), can never have dropped audio.
-        if seg.tts_wav and not seg.skipped and i + 1 < len(segments):
-            slot = _slot_end(segments, i, video_duration) - seg.start
-            if slot > 0:
-                clip_dur = _clip_duration(seg.tts_wav)
-                if clip_dur > slot:
-                    capped = clip_dur / min(clip_dur / slot, cfg.max_tempo)
-                    # capped > slot * tol: the cap couldn't fit it and the interior
-                    # trim dropped a material tail. The wide band keeps a normal
-                    # few-percent post-cap overrun from being exit-2 noise (KTD7).
-                    record = capped > slot * cfg.fit_overflow_tolerance
-        if record and existing.get(sid, {}).get("status") != "length_overflow":
-            ledger.record_fit_overflow(sid)
+        if built_durations is not None and sid in built_durations:
+            clip_dur = built_durations[sid]
         else:
-            # No overrun (or a CPS length_overflow we must not promote): drop any
-            # stale fit_overflow; clear_fit_overflow leaves other statuses intact.
-            ledger.clear_fit_overflow(sid)
+            clip_dur = _clip_duration(seg.tts_wav)
+        if clip_dur <= slot:
+            continue
+        capped = clip_dur / min(clip_dur / slot, cfg.max_tempo)
+        if i + 1 < len(segments):
+            overran = capped > slot * cfg.fit_overflow_tolerance
+        else:
+            overran = capped > slot + TAIL_HEADROOM_SEC
+        if overran:
+            overflow_ids.add(sid)
+    ledger.reconcile_fit_overflows(overflow_ids)
 
 
 def fit(state: DubState, cfg: Config) -> DubState:
@@ -187,10 +203,16 @@ def fit(state: DubState, cfg: Config) -> DubState:
         # Skip slots carry original audio: its content shapes the dub (R23)
         inputs["orig_sha"] = artifacts.cached_file_sha256(state["audio_orig"])
 
+    # Clip durations build probes on a rebuild, reused by _record_overruns so a
+    # fresh run does not re-read every clip header (a cache hit leaves this empty
+    # and the reprobe falls back to the soundfile header read).
+    built_durations: dict[str, float] = {}
+
     def build(tmp: Path) -> None:
         # Whole timeline in RAM: ~346 MB for 60 min at 24 kHz float32; scales
-        # linearly with duration * timeline_sr
-        timeline = np.zeros(int((video_duration + 1.0) * sr), dtype="float32")
+        # linearly with duration * timeline_sr. The +TAIL_HEADROOM_SEC pad gives
+        # the last clip room to spill past video_duration (U3/R2).
+        timeline = np.zeros(int((video_duration + TAIL_HEADROOM_SEC) * sr), dtype="float32")
         for i, seg in enumerate(segments):
             slot_end = _slot_end(segments, i, video_duration)
             if seg.skipped or not seg.tts_wav:
@@ -207,6 +229,7 @@ def fit(state: DubState, cfg: Config) -> DubState:
                 continue
 
             clip_dur = ffmpeg.probe_duration(seg.tts_wav)
+            built_durations[segment_id(seg)] = clip_dur
             slot = slot_end - seg.start
             overflow = clip_dur > slot and slot > 0
             if not overflow:
@@ -247,7 +270,8 @@ def fit(state: DubState, cfg: Config) -> DubState:
 
     # Surface placement-layer length overruns in the ledger on EVERY call,
     # independent of the cache hit above, so a resumed run still reports them and
-    # raises the exit code (U4/R3).
+    # raises the exit code (U4/R3). built_durations is populated only on a rebuild
+    # (empty on a cache hit -> header reprobe).
     _record_overruns(segments, video_duration,
-                     SkipLedger.from_cfg(workdir, cfg), cfg)
+                     SkipLedger.from_cfg(workdir, cfg), cfg, built_durations)
     return {"segments": segments, "dub_wav": str(dub_wav)}

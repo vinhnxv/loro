@@ -79,12 +79,26 @@ def _dub_content_end(dub_wav: str | Path, threshold: float = 1e-4) -> float:
     tail; mux runs the output to max(video, this) so a clip that legitimately
     spilled past video_duration is kept while a normal dub gains no trailing
     silence. An all-silent dub (every segment skipped in duck mode) returns 0.0,
-    so the output runs to the video length."""
-    audio, sr = sf.read(str(dub_wav), dtype="float32", always_2d=False)
-    if audio.ndim > 1:
-        audio = audio.mean(axis=1)
-    nz = np.nonzero(np.abs(audio) > threshold)[0]
-    return (int(nz[-1]) + 1) / sr if len(nz) else 0.0
+    so the output runs to the video length.
+
+    Scans backward from the file tail one block at a time instead of loading the
+    whole dub into RAM (~346 MB for a 60-min 24 kHz float32 track): only the
+    trailing silence plus the block that holds the real content end are read."""
+    with sf.SoundFile(str(dub_wav)) as f:
+        sr = f.samplerate
+        block = sr  # 1s
+        pos = len(f)  # frames
+        while pos > 0:
+            start = max(0, pos - block)
+            f.seek(start)
+            chunk = f.read(pos - start, dtype="float32", always_2d=False)
+            if chunk.ndim > 1:
+                chunk = chunk.mean(axis=1)
+            nz = np.nonzero(np.abs(chunk) > threshold)[0]
+            if len(nz):
+                return (start + int(nz[-1]) + 1) / sr
+            pos = start
+    return 0.0
 
 
 def mux(state: DubState, cfg: Config) -> DubState:

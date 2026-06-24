@@ -505,16 +505,21 @@ class Config:
     duck_volume: float = 0.15
     # Max speed-up applied to TTS audio that overflows its subtitle slot
     max_tempo: float = 1.35
-    # Material-overrun band for the placement-layer length signal (U4/KTD7). A
-    # clip that still exceeds its slot AFTER the max_tempo cap has its spilled
-    # tail trimmed at the next segment's onset (fit, U2), dropping audio; only
-    # when the capped clip exceeds slot * fit_overflow_tolerance AND that trim
-    # actually dropped audio is a `fit_overflow` recorded (report exit code 2,
-    # R3). Deliberately WIDE so exit 2 stays signal, not noise, on long videos
-    # where a ~4% post-cap overrun is normal — tighten on real-run data, mirroring
-    # slot_overflow_tolerance. Distinct from slot_overflow_tolerance (the CPS
+    # Material-overrun band for the placement-layer length signal (U4/KTD7). An
+    # INTERIOR clip that still exceeds its slot AFTER the max_tempo cap has its
+    # spilled tail trimmed at the next segment's onset (fit, U2), dropping
+    # (capped - slot) of audio; a `fit_overflow` (report exit code 2, R3) is
+    # recorded only when the capped clip exceeds slot * fit_overflow_tolerance,
+    # i.e. when more than (tolerance - 1) of the slot's worth of audio was cut.
+    # 1.10 = flag a drop past ~10% of the slot, while a normal few-percent
+    # post-cap overrun (a clip just over the cap threshold) stays off exit 2.
+    # NOTE: the prior 1.5 was a dead band — at max_tempo=1.35 a clip up to ~2.0x
+    # its slot drops up to ~48% of the capped audio yet stayed BELOW 1.5*slot, so
+    # exit 2 never fired in exactly the speed-constrained case the signal targets.
+    # Tunable on real VI-run data (the last clip is gated separately on the
+    # timeline tail headroom). Distinct from slot_overflow_tolerance (the CPS
     # re-translation escalation band): this one runs in `fit` for all languages.
-    fit_overflow_tolerance: float = 1.5
+    fit_overflow_tolerance: float = 1.10
     # Placement of a clip that is SHORTER than its slot (U3/KTD3). "center"
     # nudges the clip forward by min(fit_max_center_offset, slack/2) so a short
     # VI clip no longer finishes early and reads as "ahead" of the picture;

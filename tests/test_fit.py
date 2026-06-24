@@ -1,5 +1,6 @@
 import json
 import subprocess
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -285,11 +286,80 @@ def test_over_tolerance_overrun_records_fit_overflow(tmp_path):
 
 
 def test_sub_tolerance_overrun_does_not_record(tmp_path):
-    # 1.5s clip in a 1.0s slot: capped -> 1.11x slot, below the 1.5x band -> the
-    # tail is trimmed but it is NOT exit-2 signal (KTD7).
+    # 1.5s clip in a 1.0s slot: capped -> 1.11x slot. With an EXPLICIT wide 1.5x
+    # band the tail is trimmed but it is NOT exit-2 signal (KTD7). (The default
+    # band is tighter now — see test_material_drop_recorded_at_default_tolerance.)
     state = _two_seg_state(tmp_path, "a", clip0_dur=1.5)
     fit(state, Config(max_tempo=1.35, fit_overflow_tolerance=1.5))
     assert _fit_overflows(state["workdir"]) == set()
+
+
+def test_material_drop_recorded_at_default_tolerance(tmp_path):
+    # Regression for the 1.5 dead band: a 2.0s clip in a 1.0s slot is capped to
+    # ~1.48x slot and the interior trim drops ~32% of the post-cap audio. The old
+    # default 1.5 left this BELOW the band (silent exit 0); the 1.10 default flags
+    # it. Uses Config() so it pins the shipped default, not an explicit value.
+    state = _two_seg_state(tmp_path, "a", clip0_dur=2.0)
+    fit(state, Config())  # default max_tempo=1.35, fit_overflow_tolerance=1.10
+    assert _fit_overflows(state["workdir"]) == {"seg_0000"}
+
+
+def test_last_clip_over_headroom_records_fit_overflow(tmp_path):
+    # The LAST clip is never trimmed at an onset, but _place clamps its tail at the
+    # timeline end (slot + TAIL_HEADROOM_SEC). A 3.0s clip in a 1.0s final slot is
+    # capped to ~2.22s > 1.0 + 1.0 headroom, so ~0.22s is dropped past the headroom
+    # and mux cannot recover it — that drop must raise exit 2 (previously the last
+    # segment was skipped by the recorder and exited 0).
+    clip = tmp_path / "c.wav"
+    _tone(clip, 3.0)
+    seg = Segment(index=0, start=0.0, end=1.0, text_src="a", text_target="a", tts_wav=str(clip))
+    state = {"segments": [seg], "workdir": str(tmp_path), "video_duration": 1.0}
+    dub, sr = sf.read(fit(state, Config(max_tempo=1.35))["dub_wav"])
+    assert len(dub) == int((1.0 + fit_mod.TAIL_HEADROOM_SEC) * sr)  # tail was clamped
+    assert _fit_overflows(state["workdir"]) == {"seg_0000"}
+
+
+def test_last_clip_within_headroom_not_recorded(tmp_path):
+    # The companion to the spill test: a 2.0s last clip caps to ~1.48s, within the
+    # 1.0s slot + 1.0s headroom, so it is fully preserved by mux and is NOT exit 2.
+    clip = tmp_path / "c.wav"
+    _tone(clip, 2.0)
+    seg = Segment(index=0, start=0.0, end=1.0, text_src="a", text_target="a", tts_wav=str(clip))
+    state = {"segments": [seg], "workdir": str(tmp_path), "video_duration": 1.0}
+    fit(state, Config(max_tempo=1.35))
+    assert _fit_overflows(state["workdir"]) == set()
+
+
+def test_overrun_reconcile_is_idempotent_across_reruns(tmp_path):
+    # U4 idempotency: a resumed/cache-hit rerun with the SAME overrun must not
+    # rewrite skips.json. The previous per-segment record_fit_overflow re-saved and
+    # re-pushed a demoted window entry on every call; reconcile is a no-op when
+    # nothing changed.
+    state = _two_seg_state(tmp_path, "wd", clip0_dur=3.0)
+    cfg = Config(max_tempo=1.35, fit_overflow_tolerance=1.5)
+    fit(state, cfg)
+    skips = Path(state["workdir"]) / "skips.json"
+    assert _fit_overflows(state["workdir"]) == {"seg_0000"}
+    data1 = skips.read_text(encoding="utf-8")
+    fit(state, cfg)  # dub is a cache hit; the overrun is unchanged
+    assert skips.read_text(encoding="utf-8") == data1  # byte-identical, no rewrite
+
+
+def test_record_overruns_reuses_prebuilt_durations(tmp_path):
+    # On a rebuild fit hands _record_overruns the durations build already probed, so
+    # it does not re-read clip headers; the passed value drives the decision. The
+    # on-disk clip fits its slot, but the "built" 3.0s value overruns -> recorded.
+    clip = tmp_path / "c.wav"
+    _tone(clip, 0.5)  # 0.5s header would fit the 1.0s slot
+    segs = [
+        Segment(index=0, start=0.0, end=1.0, text_src="a", text_target="a", tts_wav=str(clip)),
+        Segment(index=1, start=1.0, end=2.0, text_src="b", text_target="b", tts_wav=str(clip)),
+    ]
+    led = SkipLedger(str(tmp_path))
+    fit_mod._record_overruns(segs, 2.0, led,
+                             Config(max_tempo=1.35, fit_overflow_tolerance=1.5),
+                             {"seg_0000": 3.0})
+    assert _fit_overflows(str(tmp_path)) == {"seg_0000"}  # passed 3.0 used, not 0.5
 
 
 def test_overrun_recorded_on_cache_hit_rerun(tmp_path):

@@ -181,6 +181,14 @@ class TestConsoleSummary:
         assert "Fit overflow" in text
         assert "seg_0019" in text
 
+    def test_fit_overflow_summary_omits_no_skips_all_clear(self, tmp_path):
+        # A fit_overflow-only run exits 2, so the "No segments were skipped."
+        # all-clear must not appear — it contradicted the exit code before.
+        SkipLedger(tmp_path).record_fit_overflow("seg_0019")
+        text = rp.console_summary(rp.build_report(tmp_path))
+        assert "Fit overflow" in text
+        assert "No segments were skipped" not in text
+
     def test_summary_mentions_asr_lid_degraded(self, tmp_path):
         (tmp_path / "asr").mkdir()
         (tmp_path / "asr" / "lid.json").write_text(

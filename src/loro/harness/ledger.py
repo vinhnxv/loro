@@ -119,15 +119,20 @@ class SkipLedger:
 
     LENGTH_OVERFLOW_SIGNATURE = ("tts", "length", "length_overflow")
 
-    def _record_non_fatal_overflow(self, segment_id: str, status: str,
-                                   signature: tuple[str, str, str]) -> None:
-        """Shared body for the two non-fatal, PRE-DEMOTED overflow records
-        (length_overflow / fit_overflow): the clip is KEPT (the segment is NOT
-        skipped), so this is a report annotation, not a failure. It stores the
-        entry (reason == status) and pushes a pre-demoted window entry so the
-        loop's expected iterations can never count toward the abort threshold. The
-        status + signature discriminate the two records; the bookkeeping is
-        identical, kept in one place so a fix (e.g. demoted=True) can't drift."""
+    def _set_overflow_entry(self, segment_id: str, status: str,
+                            signature: tuple[str, str, str], *,
+                            push_window: bool) -> None:
+        """Store a PRE-DEMOTED overflow entry (length_overflow / fit_overflow): the
+        clip is KEPT (the segment is NOT skipped), so this is a report annotation,
+        not a failure. Does NOT save — callers batch the write.
+
+        A pre-demoted WINDOW entry is pushed only when `push_window`. A
+        length_overflow is recorded inside the TTS convergence loop, so it pushes a
+        demoted entry to keep that expected iteration off the abort count. A
+        fit_overflow is post-hoc and already pre-demoted (it can never count toward
+        an abort), so a window push would only evict genuine strikes from the
+        bounded window — fit overruns on speed-constrained content pass
+        push_window=False (U4/R3)."""
         sig = list(signature)
         self._segments[segment_id] = {
             "status": status,
@@ -137,7 +142,15 @@ class SkipLedger:
             "input_hash": "",
             "demoted": True,
         }
-        self._push_window({"segment_id": segment_id, "signature": sig, "demoted": True})
+        if push_window:
+            self._push_window({"segment_id": segment_id, "signature": sig, "demoted": True})
+
+    def _record_non_fatal_overflow(self, segment_id: str, status: str,
+                                   signature: tuple[str, str, str], *,
+                                   push_window: bool) -> None:
+        """Single-record + save for a non-fatal overflow (used by the direct
+        record_* entry points; `fit` batches via reconcile_fit_overflows)."""
+        self._set_overflow_entry(segment_id, status, signature, push_window=push_window)
         self._save()
 
     def record_length_overflow(self, segment_id: str) -> None:
@@ -148,7 +161,8 @@ class SkipLedger:
         so it can never count toward the abort threshold (the loop's iteration is
         expected, not infra degradation)."""
         self._record_non_fatal_overflow(segment_id, "length_overflow",
-                                        self.LENGTH_OVERFLOW_SIGNATURE)
+                                        self.LENGTH_OVERFLOW_SIGNATURE,
+                                        push_window=True)
 
     FIT_OVERFLOW_SIGNATURE = ("fit", "length", "fit_overflow")
 
@@ -162,11 +176,15 @@ class SkipLedger:
         after the re-translation cap" — `fit_overflow` runs for all languages and
         DOES drive exit code 2, so the operator/orchestrating agent sees that a
         dub clip was materially cut. The clip is still KEPT (the segment is NOT
-        skipped). Like record_length_overflow it stores the entry and pushes a
-        PRE-DEMOTED window entry, so recurring overruns on speed-constrained
-        content can never accumulate toward the abort threshold (ledger.py)."""
+        skipped). The entry is pre-demoted, so recurring overruns on
+        speed-constrained content can never accumulate toward the abort threshold;
+        unlike length_overflow it pushes NO window entry (push_window=False), so a
+        long run of overruns can't evict genuine strikes from the bounded window.
+        `fit` calls reconcile_fit_overflows (one save per run); this direct entry
+        point exists for callers/tests that record a single id."""
         self._record_non_fatal_overflow(segment_id, "fit_overflow",
-                                        self.FIT_OVERFLOW_SIGNATURE)
+                                        self.FIT_OVERFLOW_SIGNATURE,
+                                        push_window=False)
 
     def clear_fit_overflow(self, segment_id: str) -> None:
         """Drop a stale fit_overflow entry when a recompute no longer overruns, so
@@ -176,6 +194,35 @@ class SkipLedger:
         entry = self._segments.get(segment_id)
         if entry is not None and entry["status"] == "fit_overflow":
             self._segments.pop(segment_id, None)
+            self._save()
+
+    def reconcile_fit_overflows(self, overflow_ids) -> None:
+        """Batch-reconcile placement-layer fit_overflows for a whole `fit` run in
+        ONE write (U4/R3). `overflow_ids` is the set of segment ids whose clip
+        materially overran its slot.
+
+        - Records a pre-demoted fit_overflow for each id NOT already carrying an
+          entry. A segment with ANY existing entry is left untouched: a real
+          skip/accepted_skip is never clobbered, and a CPS length_overflow is
+          never promoted (KTD2). An id already at fit_overflow is a no-op, so a
+          resumed/cache-hit rerun neither rewrites skips.json nor re-pushes window
+          state (the previous per-segment record/clear did both every call).
+        - Drops any stale fit_overflow no longer in the set (a recompute that now
+          fits clears the exit-2 signal).
+        - Writes skips.json at most once, and only when something changed."""
+        overflow_ids = set(overflow_ids)
+        changed = False
+        for sid in overflow_ids:
+            if (self._segments.get(sid) or {}).get("status") is None:
+                self._set_overflow_entry(sid, "fit_overflow",
+                                         self.FIT_OVERFLOW_SIGNATURE, push_window=False)
+                changed = True
+        stale = [sid for sid, entry in self._segments.items()
+                 if entry["status"] == "fit_overflow" and sid not in overflow_ids]
+        for sid in stale:
+            self._segments.pop(sid, None)
+            changed = True
+        if changed:
             self._save()
 
     def record_strike(self, signature: tuple[str, str, str]) -> None:

@@ -315,6 +315,10 @@ def console_summary(report: dict) -> str:
 
     if report["skipped"]:
         lines.append("Rerun the same command to retry skipped segments.")
-    if not (report["skipped"] or report["accepted_skips"] or report["abort"]):
+    # Mirror exit_code's exit-2 guard: a fit_overflow-only run is NOT clean, so it
+    # must not print the "No segments were skipped." all-clear (it would read as a
+    # success next to the "Fit overflow" block while the process exits 2).
+    if not (report["skipped"] or report["accepted_skips"] or report["abort"]
+            or report.get("fit_overflows")):
         lines.append("No segments were skipped.")
     return "\n".join(lines)
