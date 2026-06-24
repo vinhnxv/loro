@@ -28,6 +28,7 @@ import time
 from pathlib import Path
 
 import requests
+from requests.exceptions import RequestException
 
 from loro.config import Config
 from loro.harness.retry import CONTENT, INFRA, StageError, with_retry
@@ -149,21 +150,40 @@ def _create(cfg: Config, file_id: str, context: dict | None,
 def _poll(cfg: Config, transcription_id: str, duration: float) -> None:
     """Block until the transcription is completed. The wall-clock ceiling scales
     with audio length (mirrors assemblyai); a job that never reaches
-    completed/error within it is a poll_timeout, and the loop is not retried."""
+    completed/error within it is a poll_timeout, and the loop is not retried.
+
+    A TRANSIENT status-GET failure must not discard the already-created (paid)
+    job (B3/R5/KTD3): a 5xx (infra-class StageError from _raise_for_status) OR a
+    raw connection/timeout error (the caffeinate/sleep socket-reset mode, which
+    surfaces as a requests.RequestException, NOT a StageError) is logged and
+    polling continues until the existing deadline. Only a 4xx/content error, an
+    explicit status=="error", or the deadline ends the loop — the single
+    wall-clock ceiling is preserved, no new retry wrapper."""
     budget = cfg.soniox_stt_poll_timeout_base + cfg.soniox_stt_poll_timeout_per_sec * duration
     deadline = time.monotonic() + budget
     url = f"{cfg.soniox_stt_base_url}/v1/transcriptions/{transcription_id}"
     while True:
-        resp = requests.get(url, headers=_headers(cfg),
-                            timeout=cfg.soniox_stt_request_timeout)
-        _raise_for_status(resp, "poll")
-        payload = resp.json()
-        status = payload.get("status")
-        if status == "completed":
-            return
-        if status == "error":
-            raise StageError(STAGE, CONTENT, "soniox_error",
-                             payload.get("error_message", "transcription failed"))
+        status = None
+        try:
+            resp = requests.get(url, headers=_headers(cfg),
+                                timeout=cfg.soniox_stt_request_timeout)
+            _raise_for_status(resp, "poll")
+            payload = resp.json()
+            status = payload.get("status")
+        except StageError as exc:
+            if exc.error_class != INFRA:
+                raise  # 4xx / content (e.g. bad key) -> fail fast, no retry
+            log.warning("Soniox STT poll transient error (%s) — continuing to poll "
+                        "within the %.0fs budget", exc.code, budget)
+        except RequestException as exc:
+            log.warning("Soniox STT poll connection error (%s) — continuing to poll "
+                        "within the %.0fs budget", type(exc).__name__, budget)
+        else:
+            if status == "completed":
+                return
+            if status == "error":
+                raise StageError(STAGE, CONTENT, "soniox_error",
+                                 payload.get("error_message", "transcription failed"))
         if time.monotonic() >= deadline:
             raise StageError(STAGE, INFRA, "poll_timeout",
                              f"status={status!r} after {budget:.0f}s budget")

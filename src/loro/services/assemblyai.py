@@ -23,6 +23,7 @@ import time
 from pathlib import Path
 
 import requests
+from requests.exceptions import RequestException
 
 from loro.config import Config
 from loro.harness.retry import CONTENT, INFRA, StageError, with_retry
@@ -96,20 +97,38 @@ def _create(cfg: Config, audio_url: str) -> str:
 def _poll(cfg: Config, transcript_id: str, duration: float) -> dict:
     # Wall-clock ceiling scales with audio length (mirrors asr_timeout_*); a
     # transcript that never reaches completed/error within it is a poll_timeout.
+    #
+    # A TRANSIENT status-GET failure must not discard the already-created (paid)
+    # transcript (B3/R5/KTD3): a 5xx (infra-class StageError) OR a raw
+    # connection/timeout error (which surfaces as a requests.RequestException, not
+    # a StageError) is logged and polling continues until the existing deadline.
+    # Only a 4xx/content error, an explicit status=="error", or the deadline ends
+    # the loop — the single wall-clock ceiling is preserved, no new retry wrapper.
     budget = cfg.assemblyai_poll_timeout_base + cfg.assemblyai_poll_timeout_per_sec * duration
     deadline = time.monotonic() + budget
     url = f"{cfg.assemblyai_base_url}/transcript/{transcript_id}"
     while True:
-        resp = requests.get(url, headers=_headers(cfg),
-                            timeout=cfg.assemblyai_request_timeout)
-        _raise_for_status(resp, "poll")
-        payload = resp.json()
-        status = payload.get("status")
-        if status == "completed":
-            return payload
-        if status == "error":
-            raise StageError(STAGE, CONTENT, "assemblyai_error",
-                             payload.get("error", "transcription failed"))
+        status = None
+        try:
+            resp = requests.get(url, headers=_headers(cfg),
+                                timeout=cfg.assemblyai_request_timeout)
+            _raise_for_status(resp, "poll")
+            payload = resp.json()
+            status = payload.get("status")
+        except StageError as exc:
+            if exc.error_class != INFRA:
+                raise  # 4xx / content (e.g. bad key) -> fail fast, no retry
+            log.warning("AssemblyAI poll transient error (%s) — continuing to poll "
+                        "within the %.0fs budget", exc.code, budget)
+        except RequestException as exc:
+            log.warning("AssemblyAI poll connection error (%s) — continuing to poll "
+                        "within the %.0fs budget", type(exc).__name__, budget)
+        else:
+            if status == "completed":
+                return payload
+            if status == "error":
+                raise StageError(STAGE, CONTENT, "assemblyai_error",
+                                 payload.get("error", "transcription failed"))
         if time.monotonic() >= deadline:
             raise StageError(STAGE, INFRA, "poll_timeout",
                              f"status={status!r} after {budget:.0f}s budget")

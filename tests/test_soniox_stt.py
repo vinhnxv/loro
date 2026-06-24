@@ -57,9 +57,11 @@ class _FakeHTTP:
 
     def get(self, url, headers=None, timeout=None):
         self.calls.append(("get", url))
-        if url.endswith("/transcript"):
-            return self.transcript_responses.pop(0)
-        return self.poll_responses.pop(0)
+        resp = (self.transcript_responses.pop(0) if url.endswith("/transcript")
+                else self.poll_responses.pop(0))
+        if isinstance(resp, BaseException):
+            raise resp  # simulate a raw connection/timeout error on the GET
+        return resp
 
     def delete(self, url, headers=None, timeout=None):
         self.calls.append(("delete", url))
@@ -200,6 +202,46 @@ def test_transient_5xx_on_transcript_fetch_retries_fetch_not_job(http):
     assert [c for c in http.calls if c[0] == "get"
             and c[1].endswith("/transcript")] == [
         ("get", "https://api.soniox.com/v1/transcriptions/tr-1/transcript")] * 2
+
+
+# --- U5: poll resilience to transient status-GET failures (B3/R5/KTD3) ---
+
+def test_poll_transient_5xx_then_completed_succeeds(http):
+    http.poll_responses = [_Resp(503, text="upstream error"),
+                           _Resp(200, {"status": "completed"})]
+    http.transcript_responses = [_Resp(200, _tokens())]
+    result = stt.transcribe(_cfg(), http.audio)
+    assert result == _tokens()  # the paid job is not discarded on a 503 poll
+    # two poll GETs against the job: the 503 was retried within budget
+    job_gets = [c for c in http.calls if c[0] == "get" and not c[1].endswith("/transcript")]
+    assert job_gets == [("get", "https://api.soniox.com/v1/transcriptions/tr-1")] * 2
+
+
+def test_poll_connection_error_then_completed_succeeds(http):
+    import requests as _requests
+    http.poll_responses = [_requests.ConnectionError("socket reset"),
+                           _Resp(200, {"status": "completed"})]
+    http.transcript_responses = [_Resp(200, _tokens())]
+    result = stt.transcribe(_cfg(), http.audio)
+    assert result == _tokens()  # a socket reset on the poll does not lose the job
+
+
+def test_poll_4xx_raises_immediately(http):
+    http.poll_responses = [_Resp(422, text="bad request")]
+    with pytest.raises(StageError) as exc_info:
+        stt.transcribe(_cfg(), http.audio)
+    assert exc_info.value.error_class == "content"
+    assert exc_info.value.code == "http_422"
+    assert [c[0] for c in http.calls].count("get") == 1  # fail fast, no poll retry
+
+
+def test_persistent_5xx_raises_poll_timeout_not_raw(http):
+    http.poll_responses = [_Resp(503, text="upstream error")] * 3
+    cfg = _cfg(soniox_stt_poll_timeout_base=0.0, soniox_stt_poll_timeout_per_sec=0.0)
+    with pytest.raises(StageError) as exc_info:
+        stt.transcribe(cfg, http.audio)
+    # the deadline ends the loop with poll_timeout, never the raw 5xx
+    assert exc_info.value.signature == ("asr", "infra", "poll_timeout")
 
 
 def test_cleanup_deletes_file_and_transcription_when_on(http):

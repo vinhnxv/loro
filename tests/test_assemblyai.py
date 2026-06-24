@@ -47,7 +47,10 @@ class _FakeHTTP:
 
     def get(self, url, headers=None, timeout=None):
         self.calls.append(("get", url))
-        return self.poll_responses.pop(0)
+        resp = self.poll_responses.pop(0)
+        if isinstance(resp, BaseException):
+            raise resp  # simulate a raw connection/timeout error on the GET
+        return resp
 
 
 @pytest.fixture
@@ -129,6 +132,40 @@ def test_transient_5xx_on_upload_retries_then_succeeds(http):
     assert result["status"] == "completed"
     # upload posted twice (one 503 retry), then create once
     assert [c[0] for c in http.calls].count("post") == 3
+
+
+# --- U5: poll resilience to transient status-GET failures (B3/R5/KTD3) ---
+
+def test_poll_transient_5xx_then_completed_succeeds(http):
+    http.poll_responses = [_Resp(503, text="upstream error"),
+                           _Resp(200, {"status": "completed", "words": []})]
+    result = aai.transcribe(_cfg(), http.audio)
+    assert result["status"] == "completed"  # paid transcript not discarded on 503
+    assert [c[0] for c in http.calls].count("get") == 2  # 503 retried within budget
+
+
+def test_poll_connection_error_then_completed_succeeds(http):
+    import requests as _requests
+    http.poll_responses = [_requests.Timeout("read timed out"),
+                           _Resp(200, {"status": "completed", "words": []})]
+    result = aai.transcribe(_cfg(), http.audio)
+    assert result["status"] == "completed"
+
+
+def test_poll_4xx_raises_immediately(http):
+    http.poll_responses = [_Resp(422, text="bad request")]
+    with pytest.raises(StageError) as exc_info:
+        aai.transcribe(_cfg(), http.audio)
+    assert exc_info.value.signature == ("asr", "content", "http_422")
+    assert [c[0] for c in http.calls].count("get") == 1  # fail fast, no poll retry
+
+
+def test_persistent_5xx_raises_poll_timeout(http):
+    http.poll_responses = [_Resp(503, text="upstream error")] * 3
+    cfg = _cfg(assemblyai_poll_timeout_base=0.0, assemblyai_poll_timeout_per_sec=0.0)
+    with pytest.raises(StageError) as exc_info:
+        aai.transcribe(cfg, http.audio)
+    assert exc_info.value.signature == ("asr", "infra", "poll_timeout")
 
 
 def test_api_key_never_logged_on_error(http, caplog):
