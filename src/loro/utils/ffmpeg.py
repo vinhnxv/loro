@@ -155,8 +155,17 @@ def detect_scenes(path: str | Path, threshold: float = 0.35) -> list[float]:
     return [float(m) for m in re.findall(r"pts_time:\s*([\d.]+)", proc.stderr)]
 
 
-def atempo(src: str, out: str, factor: float) -> None:
-    """Time-stretch audio by `factor` (>1 = faster). Chains filters outside [0.5, 2]."""
+def _atempo_filters(factor: float) -> list[str]:
+    """Build the atempo filter chain for `factor` (>1 = faster), split into
+    per-filter steps inside ffmpeg's supported [0.5, 2.0] range.
+
+    A non-positive factor is rejected up front (B9/R12): atempo=0 / negative is
+    meaningless, and the chaining loop divides `remaining` toward zero, so it
+    would never fall back inside [0.5, 2.0] and would loop forever building
+    filters. The sole caller (fit) already passes factor > 0, so this is
+    defensive hardening of a public util with no behavior change for valid input."""
+    if factor <= 0:
+        raise ValueError(f"atempo factor must be positive, got {factor}")
     filters = []
     remaining = factor
     while remaining > 2.0:
@@ -166,4 +175,9 @@ def atempo(src: str, out: str, factor: float) -> None:
         filters.append("atempo=0.5")
         remaining /= 0.5
     filters.append(f"atempo={remaining:.6f}")
-    ffmpeg("-i", src, "-filter:a", ",".join(filters), out)
+    return filters
+
+
+def atempo(src: str, out: str, factor: float) -> None:
+    """Time-stretch audio by `factor` (>1 = faster). Chains filters outside [0.5, 2]."""
+    ffmpeg("-i", src, "-filter:a", ",".join(_atempo_filters(factor)), out)

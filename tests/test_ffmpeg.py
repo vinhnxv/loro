@@ -54,6 +54,24 @@ class TestDetectScenes:
             ffmpeg.detect_scenes(bad)
 
 
+class TestAtempo:
+    # U12/B9/R12: a non-positive factor must raise, not loop forever.
+    def test_zero_factor_raises_not_hangs(self):
+        with pytest.raises(ValueError):
+            ffmpeg.atempo("in.wav", "out.wav", 0.0)
+
+    def test_negative_factor_raises(self):
+        with pytest.raises(ValueError):
+            ffmpeg.atempo("in.wav", "out.wav", -1.0)
+
+    def test_in_range_factors_build_expected_chain(self):
+        # regression: valid factors are unchanged, split correctly outside [0.5, 2]
+        assert ffmpeg._atempo_filters(1.35) == ["atempo=1.350000"]
+        assert ffmpeg._atempo_filters(8.0) == ["atempo=2.0", "atempo=2.0",
+                                               "atempo=2.000000"]
+        assert ffmpeg._atempo_filters(0.25) == ["atempo=0.5", "atempo=0.500000"]
+
+
 class TestExtractFramesWindow:
     def test_writes_count_frames_in_window(self, tmp_path):
         v = tmp_path / "two.mp4"
