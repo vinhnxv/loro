@@ -114,6 +114,21 @@ def _vision_degraded(workdir: Path) -> dict | None:
     return None
 
 
+def _asr_lid_degraded(workdir: Path) -> dict | None:
+    """Surface a mixed / low-confidence Soniox `--source-lang auto` detection
+    (B7/R9) from the durable asr/lid.json marker the soniox provider writes —
+    auditable without scanning logs. Parallel to _vision_degraded."""
+    try:
+        data = json.loads((workdir / "asr" / "lid.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if data.get("degraded"):
+        return {"detected": data.get("detected", "unknown"),
+                "hint": "--source-lang auto detection was mixed or low-confidence; "
+                        "verify the source language and re-run if wrong"}
+    return None
+
+
 def _overrides_status(workdir: Path, valid_ids: set[str] | None) -> dict | None:
     """Surface which override keys actually match current segments, so a
     re-segmented ASR run makes misapplied overrides visible."""
@@ -147,6 +162,11 @@ def build_report(
     # exit code).
     length_overflows = {k: v for k, v in entries.items()
                         if v["status"] == "length_overflow"}
+    # Placement-layer overruns (U4/R3): a clip that materially overran its slot
+    # after the tempo cap and had its spilled tail trimmed (dub audio dropped).
+    # Distinct from length_overflow — this DOES drive exit code 2.
+    fit_overflows = {k: v for k, v in entries.items()
+                     if v["status"] == "fit_overflow"}
     crosscheck = _crosscheck_report(workdir, valid_ids)
 
     # Language-run config (R22/agent-legibility, #14): which language pair ran and
@@ -172,11 +192,13 @@ def build_report(
         "skipped": skipped,
         "accepted_skips": accepted,
         "length_overflows": length_overflows,
+        "fit_overflows": fit_overflows,
         "crosscheck_replacements": crosscheck["replacements"],
         "crosscheck_low_confidence": crosscheck["low_confidence"],
         "crosscheck_sub_rejected": crosscheck["sub_rejected"],
         "crosscheck_summary": crosscheck["summary"],
         "vision_degraded": _vision_degraded(workdir),
+        "asr_lid_degraded": _asr_lid_degraded(workdir),
         "overrides": _overrides_status(workdir, valid_ids),
         "stage_timings_sec": {k: round(v, 2) for k, v in (stage_timings or {}).items()},
         "abort": abort_info,
@@ -190,12 +212,16 @@ def write_report(workdir: str | Path, report: dict) -> Path:
 
 
 def exit_code(report: dict) -> int:
-    """0 clean; 2 completed with skips/accepted-skips; 3 aborted; 1 fatal (R25)."""
+    """0 clean; 2 completed with skips/accepted-skips OR placement-layer
+    fit_overflows (U4/R3 — a dub clip materially overran its slot and was
+    trimmed); 3 aborted; 1 fatal (R25). A degraded auto-LID detection
+    (asr_lid_degraded) is a caveat, not corruption, so it does NOT raise the exit
+    code on its own — callers must read report.json for it."""
     if report["status"] == "aborted":
         return 3
     if report["status"] == "failed":
         return 1
-    if report["skipped"] or report["accepted_skips"]:
+    if report["skipped"] or report["accepted_skips"] or report.get("fit_overflows"):
         return 2
     return 0
 
@@ -224,6 +250,13 @@ def console_summary(report: dict) -> str:
         lines.append(f"Length overflow ({len(overflows)}) — clips kept best-effort, "
                      "could not fit slot:")
         for seg in sorted(overflows):
+            lines.append(f"  - {seg}")
+
+    fit_overflows = report.get("fit_overflows") or {}
+    if fit_overflows:
+        lines.append(f"Fit overflow ({len(fit_overflows)}) — clip materially overran "
+                     "its slot after the tempo cap; spilled dub audio was trimmed:")
+        for seg in sorted(fit_overflows):
             lines.append(f"  - {seg}")
 
     summary = report.get("crosscheck_summary")
@@ -266,6 +299,11 @@ def console_summary(report: dict) -> str:
         lines.append(f"Vision degraded: {report['vision_degraded']['reason']} "
                      f"({report['vision_degraded']['hint']})")
 
+    if report.get("asr_lid_degraded"):
+        lines.append(f"ASR language detection uncertain (detected "
+                     f"{report['asr_lid_degraded']['detected']}): "
+                     f"{report['asr_lid_degraded']['hint']}")
+
     if report.get("overrides") and report["overrides"]["unmatched"]:
         lines.append("WARNING: override matches no existing segment: "
                      + ", ".join(report["overrides"]["unmatched"])
@@ -277,6 +315,10 @@ def console_summary(report: dict) -> str:
 
     if report["skipped"]:
         lines.append("Rerun the same command to retry skipped segments.")
-    if not (report["skipped"] or report["accepted_skips"] or report["abort"]):
+    # Mirror exit_code's exit-2 guard: a fit_overflow-only run is NOT clean, so it
+    # must not print the "No segments were skipped." all-clear (it would read as a
+    # success next to the "Fit overflow" block while the process exits 2).
+    if not (report["skipped"] or report["accepted_skips"] or report["abort"]
+            or report.get("fit_overflows")):
         lines.append("No segments were skipped.")
     return "\n".join(lines)

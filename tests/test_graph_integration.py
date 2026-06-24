@@ -232,6 +232,39 @@ def test_topology_no_seg_visual_wires_voice_ref_to_context():
     assert "seg_visual" not in {n for pair in edges for n in pair}
 
 
+# --- U13: single-writer-after-join state contract (A1/R13/KTD6) ---
+
+def test_parallel_join_keeps_both_branches_and_post_join_mutation(tmp_path, video, model_stubs):
+    # Characterization: the sentence_seg || vision parallel join yields a state
+    # carrying BOTH the segment backbone (sentence_seg branch) and the vision
+    # context/keywords (vision branch) — neither is dropped — and the post-join
+    # linear chain's in-place segment mutation (translate's text_target) is
+    # reflected downstream.
+    final = _invoke(tmp_path, video)
+    assert final["segments"]                               # sentence_seg branch landed
+    assert final.get("video_context")                     # vision branch landed
+    assert "video_keywords" in final                      # vision branch landed
+    assert all(s.text_target for s in final["segments"])  # post-join mutation reflected
+
+
+def test_single_writer_merge_raises_on_concurrent_non_empty_double_write():
+    # Fail-loud: two concurrent non-empty writes to a single-writer channel are
+    # the dropped-update bug R13 targets — they raise, never silently pick one.
+    from loro.state import Segment, StateContractError, single_writer_merge
+    a = [Segment(index=0, start=0.0, end=1.0, text_src="a")]
+    b = [Segment(index=0, start=0.0, end=1.0, text_src="b")]
+    with pytest.raises(StateContractError):
+        single_writer_merge(a, b)
+
+
+def test_single_writer_merge_prefers_non_empty_side():
+    from loro.state import Segment, single_writer_merge
+    segs = [Segment(index=0, start=0.0, end=1.0, text_src="a")]
+    assert single_writer_merge([], segs) == segs          # empty existing -> update
+    assert single_writer_merge(segs, []) == segs          # empty update -> existing
+    assert single_writer_merge(None, segs) == segs
+
+
 def test_full_run_then_instant_rerun(tmp_path, video, model_stubs):
     final = _invoke(tmp_path, video)
 

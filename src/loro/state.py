@@ -44,6 +44,39 @@ def segment_id(segment: "Segment | int") -> str:
     return f"seg_{index:04d}"
 
 
+class StateContractError(RuntimeError):
+    """The graph's single-writer-after-join contract was violated: two concurrent
+    branches each wrote a non-empty value to a single-writer channel (R13/A1)."""
+
+
+def single_writer_merge(existing, update):
+    """Fail-loud merge for the single-writer `segments` / `words` channels
+    (R13/A1/KTD6).
+
+    The graph contract is SINGLE-WRITER-AFTER-JOIN: `asr` writes segments+words
+    sequentially upstream; on the two parallel branches `sentence_seg` rewrites
+    `segments` while `vision` writes only `video_context`/`video_keywords` —
+    DISJOINT keys — and the join feeds a LINEAR chain
+    (crosscheck→voice_ref→…→mux) where exactly one writer mutates `segments` at a
+    time. Last-writer-wins is therefore safe today, which the characterization
+    test in test_graph_integration pins.
+
+    This is the merge a future reducer MUST adopt if a second CONCURRENT writer of
+    `segments`/`words` is ever introduced: two concurrent non-empty writes are
+    exactly the dropped-update bug R13 targets, so they RAISE instead of silently
+    picking one (last-writer-wins); an empty/None side — the common no-op
+    concurrent write — defers to the non-empty side. It is deliberately NOT yet
+    wired as a LangGraph `Annotated` reducer (KTD6): with disjoint keys it would be
+    inert, and wiring it needs the Annotated-on-TypedDict version gate — both that
+    and the merge-by-index reducer are deferred until a real concurrent writer
+    exists."""
+    if existing and update and existing is not update:
+        raise StateContractError(
+            "concurrent non-empty writes to a single-writer channel "
+            "(segments/words); a reducer must merge by index, never drop one (R13)")
+    return update if update else existing
+
+
 class DubState(TypedDict, total=False):
     video_path: str
     workdir: str
@@ -56,6 +89,11 @@ class DubState(TypedDict, total=False):
     # this in any node's artifact `inputs` fingerprint — it would bloat cache
     # keys; hash it explicitly (see sentence_seg._words_sha) instead.
     words: list[dict]
+    # SINGLE-WRITER-AFTER-JOIN contract (R13/A1/KTD6): `asr` writes segments+words
+    # sequentially upstream; after the sentence_seg/vision parallel join (which
+    # write DISJOINT keys) exactly one branch mutates `segments` at a time, so
+    # last-writer-wins is safe. If a second concurrent writer is ever added, wire
+    # `single_writer_merge` as the channel reducer so a dropped update fails loud.
     segments: list[Segment]
     # Resolved input language reaching the translation prompt (U7): the configured
     # source_lang (default "en", byte-identical) or, with source_lang="auto", the

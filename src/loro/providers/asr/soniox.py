@@ -8,6 +8,7 @@ tail (EN SRT + return); this provider owns the engine-specific mapping and its
 own no-speech guard so the trigger/message stay byte-identical (KTD3).
 """
 
+import json
 import logging
 from collections import Counter
 
@@ -151,6 +152,21 @@ def _group_soniox_tokens(tokens: list[dict]) -> list[dict]:
     return words
 
 
+def _write_lid_marker(asr_dir, source_lang: str, degraded: bool) -> None:
+    """Surface a mixed / low-confidence `--source-lang auto` detection to the
+    operator (B7/R9), following the vision_degraded durable-marker precedent. The
+    marker is SEPARATE from the fingerprinted soniox.json so recording the caveat
+    never busts the ASR cache or re-bills; report._asr_lid_degraded reads it and
+    surfaces it as a top-level report field. Written when degraded, removed
+    otherwise so a re-run that detects cleanly clears a stale marker."""
+    marker = asr_dir / "lid.json"
+    if degraded:
+        marker.write_text(json.dumps({"degraded": True, "detected": source_lang},
+                                     ensure_ascii=False), encoding="utf-8")
+    else:
+        marker.unlink(missing_ok=True)
+
+
 class SonioxAsrProvider:
     name = "soniox"
     # Cloud engine: its own source of truth, so the graph omits the Granite
@@ -190,8 +206,18 @@ class SonioxAsrProvider:
             lambda: soniox_stt.transcribe(cfg, audio, language_hints=hints,
                                           enable_language_identification=lid),
         )
-        source_lang = (_detect_source_language(raw, "en")[0] if auto
-                       else cfg.source_lang)
+        # auto LID detection runs on every call (outside the cached produce_json),
+        # so a resumed run still surfaces the caveat. The flag is written to a
+        # separate marker (NOT soniox.json) so it never re-bills (U9/R9).
+        if auto:
+            source_lang, lid_degraded = _detect_source_language(raw, "en")
+            _write_lid_marker(asr_dir, source_lang, lid_degraded)
+        else:
+            source_lang = cfg.source_lang
+            # Clear any stale marker a prior --source-lang auto run left on this
+            # workdir, so the report never shows a degraded-LID signal for a run
+            # that did not use auto detection.
+            _write_lid_marker(asr_dir, source_lang, False)
 
         words = _group_soniox_tokens(raw.get("tokens") or [])
         if not words:

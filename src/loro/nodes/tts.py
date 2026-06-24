@@ -377,8 +377,11 @@ def _rewrite_target_srt(state: DubState, cfg: Config, segments: list[Segment]) -
     words = state.get("words") or []
     srt_path = workdir / f"transcript.{cfg.target_lang.lower()}.srt"
     srt_path.write_text(
+        # Same per-language budget as translate's render (U14): the measured loop
+        # fires precisely for CPS profiles, so reverting to the global here would
+        # silently undo the profile budget for the exact languages it targets.
         srt.to_srt_wrapped(segments, words, side="target",
-                           max_chars=cfg.srt_max_cue_chars, max_dur=cfg.srt_max_cue_dur),
+                           max_chars=cfg.srt_target_max_cue_chars, max_dur=cfg.srt_max_cue_dur),
         encoding="utf-8")
     manifest = workdir / "translate" / "segments.json"
     if manifest.exists():

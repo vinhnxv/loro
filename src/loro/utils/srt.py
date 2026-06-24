@@ -18,7 +18,10 @@ _TAG_RE = re.compile(r"<[^>]+>")
 
 
 def fmt_time(seconds: float) -> str:
-    ms = int(round(seconds * 1000))
+    # Clamp slightly-negative upstream times (e.g. a clip-onset pad subtracted
+    # below 0) to 0 so the divmod decomposition can never emit a negative
+    # field like "-1:59:59,500", which no player accepts (B1/R4).
+    ms = int(round(max(seconds, 0.0) * 1000))
     h, ms = divmod(ms, 3_600_000)
     m, ms = divmod(ms, 60_000)
     s, ms = divmod(ms, 1000)
@@ -46,8 +49,13 @@ def to_srt(segments: list[Segment], side: str = "source") -> str:
 
 
 def _render_cues(cues: list["Cue"]) -> str:
+    # Drop degenerate cues (end <= start) rather than writing a zero-duration
+    # block like "00:00:00,000 --> 00:00:00,000": a cue whose covered words all
+    # land on seg.start can tile to start == end. Mirrors the `end > start`
+    # guard parse_cues already applies on the read side (B12/R4). Renumber after
+    # filtering so the emitted indices stay contiguous (1..N).
     blocks = []
-    for i, cue in enumerate(cues, 1):
+    for i, cue in enumerate((c for c in cues if c.end > c.start), 1):
         blocks.append(f"{i}\n{fmt_time(cue.start)} --> {fmt_time(cue.end)}\n{cue.text}\n")
     return "\n".join(blocks)
 

@@ -6,10 +6,12 @@ chain the rest of the multi-language refactor reads instead of `if lang == "vi"`
 """
 
 import ast
+import dataclasses
 import pathlib
 
 import pytest
 
+from loro.config import Config
 from loro.harness import qa
 from loro.nodes import translate
 from loro.profiles import GENERIC, is_profiled, registered_tags, resolve
@@ -160,3 +162,34 @@ def test_profiles_module_is_pure_no_nodes_import():
                 if any(m == f or m.startswith(f + ".") for f in forbidden):
                     offenders.append(f"{src.name}: {m}")
     assert offenders == [], f"profiles must stay pure; found imports: {offenders}"
+
+
+# --- U14/B11: per-language SRT cue-char budget wiring (phase-1, surfaced inert) ---
+
+class TestSrtTargetBudget:
+    def test_vi_keeps_global_budget(self):
+        # R19 key guard: VI (syllable model) uses the global cue-char budget, so
+        # its subtitle bytes never move.
+        cfg = Config()
+        assert cfg.srt_target_max_cue_chars == cfg.srt_max_cue_chars
+
+    def test_cps_budget_is_reading_speed_clamped_and_inert_today(self):
+        # CPS profiles derive min(global, cps_max * max_dur). With the shipped
+        # cps_max=17.0 and max_dur=6.0 -> 102 >= global 84, so the global binds and
+        # the wiring is INERT for FR/ES today (no behavior change) — it needs a
+        # calibrated lower cps_max to bite (deferred follow-up). Surfaced, not
+        # silently merged.
+        cfg = Config(target_lang="fr")
+        assert cfg.srt_target_max_cue_chars == min(
+            cfg.srt_max_cue_chars, int(17.0 * cfg.srt_max_cue_dur))
+        assert cfg.srt_target_max_cue_chars == cfg.srt_max_cue_chars  # inert (84)
+
+    def test_calibrated_lower_cps_max_tightens_budget(self, monkeypatch):
+        # Proves the wiring will bite once FR/ES cps_max is calibrated: a synthetic
+        # profile with cps_max=10 -> 10*6=60 < global 84 -> the budget tightens.
+        cfg = Config(target_lang="fr")
+        tight = dataclasses.replace(cfg.language_profile, cps_max=10.0)
+        monkeypatch.setattr(type(cfg), "language_profile",
+                            property(lambda self: tight))
+        assert cfg.srt_target_max_cue_chars == 60
+        assert cfg.srt_target_max_cue_chars < cfg.srt_max_cue_chars

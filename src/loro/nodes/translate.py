@@ -153,7 +153,20 @@ def _translate_lines(cfg: Config, profile, lines: list[dict],
     )
     items = llm.extract_json(reply)
     key = profile.output_key
-    result = {int(item["i"]): str(item[key]).strip() for item in items}
+    # extract_json can return a list OR a dict (a model that wraps the array in an
+    # object), and a list item can be the wrong type or mis-keyed. That is a model
+    # OUTPUT-shape failure (CONTENT), not a programmer error — classify it as a
+    # content StageError so the batch/per-segment handlers record it as a skip,
+    # rather than the U8 narrowing letting a malformed-but-parseable reply crash
+    # the run. A genuine bug in OUR code stays outside this guard and propagates.
+    if not isinstance(items, list):
+        raise StageError("translate", "content", "bad_shape",
+                         f"expected a JSON array, got {type(items).__name__}")
+    try:
+        result = {int(item["i"]): str(item[key]).strip() for item in items}
+    except (KeyError, TypeError, ValueError) as exc:
+        raise StageError("translate", "content", "bad_shape",
+                         f"malformed translation item: {exc}") from exc
     # A truncated reply (e.g. a leaked <think> ate max_tokens, KTD6) silently
     # drops indices. Surface it as a content error so the missing segments are
     # retried/strike-counted instead of falling quietly to translate_failed (U6).
@@ -234,7 +247,12 @@ def _compute_batch(cfg: Config, profile, art: Path, batch: list[Segment],
                             "skipping per-segment fallback", exc)
             else:
                 log.exception("batch translation failed, retrying segment by segment")
-        except Exception:
+        except ValueError:
+            # A malformed / parse-failed model reply (extract_json) is a CONTENT
+            # failure: fall through to the per-segment retry. A programmer error
+            # (KeyError/TypeError/…) is deliberately NOT caught here — it propagates
+            # with its stack instead of falling silently through to the per-segment
+            # retry and being downgraded to a skip (B5/R8).
             log.exception("batch translation failed, retrying segment by segment")
 
     for seg in need:
@@ -251,7 +269,12 @@ def _compute_batch(cfg: Config, profile, art: Path, batch: list[Segment],
                 text_target = single.get(seg.index, "")
                 if not text_target:
                     raise ValueError(f"no translation returned for segment {seg.index}")
-            except Exception as exc:
+            except (StageError, ValueError) as exc:
+                # Only the EXPECTED content failures become a per-segment skip: an
+                # LLM StageError, or the explicit "no translation returned" / parse
+                # ValueError. A programmer error (KeyError, TypeError, …) propagates
+                # with its stack instead of vanishing as a translate_failed skip
+                # (B5/R8).
                 signature = exc.signature if isinstance(exc, StageError) \
                     else ("translate", *classify(exc))
                 log.warning("segment %d translate failed (%s) — skipped", seg.index, exc)
@@ -429,7 +452,7 @@ def translate(state: DubState, cfg: Config) -> DubState:
     srt_target = workdir / f"transcript.{tgt_tag}.srt"
     srt_target.write_text(
         srt.to_srt_wrapped(segments, words, side="target",
-                           max_chars=cfg.srt_max_cue_chars, max_dur=cfg.srt_max_cue_dur),
+                           max_chars=cfg.srt_target_max_cue_chars, max_dur=cfg.srt_max_cue_dur),
         encoding="utf-8")
     log.info("target SRT -> %s", srt_target)
     return {"segments": segments, "srt_target": str(srt_target)}

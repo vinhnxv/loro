@@ -61,11 +61,21 @@ def main() -> None:
         line = line.strip()
         if not line:
             continue
-        req = json.loads(line)
-        out = req["out"]
+        # One malformed stdin line (bad JSON, or missing out/text) must not kill
+        # the warm worker and force a costly model reload (B13/R10): skip it with a
+        # logged warning to stderr and keep serving, mirroring the Nemotron
+        # parser's defensive `(JSONDecodeError, KeyError, TypeError) -> continue`.
+        try:
+            req = json.loads(line)
+            out = req["out"]
+            text = req["text"]
+        except (json.JSONDecodeError, KeyError, TypeError) as exc:
+            print(f"vieneu worker: skipping malformed request "
+                  f"({type(exc).__name__}): {line[:200]}", file=sys.stderr, flush=True)
+            continue
         try:
             audio = tts.infer(
-                req["text"],
+                text,
                 ref_audio=req.get("ref_audio") or None,
                 ref_text=req.get("ref_text") or None,
                 emotion=req.get("emotion") or default_emotion,

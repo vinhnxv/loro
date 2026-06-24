@@ -149,6 +149,36 @@ class TestAbortWindow:
         assert status == "skipped"  # not accepted_skip: old strike was demoted
 
 
+class TestFitOverflow:
+    def test_record_fit_overflow_entry_is_pre_demoted(self, tmp_path):
+        led = _ledger(tmp_path)
+        led.record_fit_overflow("seg_0019")
+        entry = led.entries()["seg_0019"]
+        assert entry["status"] == "fit_overflow"
+        assert entry["demoted"] is True
+
+    def test_fit_overflow_never_counts_toward_abort(self, tmp_path):
+        # Pre-demoted window entries: a run of overruns on speed-constrained
+        # content can never accumulate toward AbortRun.
+        led = _ledger(tmp_path, window=20, abort_threshold=3)
+        for i in range(10):
+            led.record_fit_overflow(f"seg_{i:04d}")   # must not raise AbortRun
+
+    def test_clear_fit_overflow_removes_only_fit_overflow(self, tmp_path):
+        led = _ledger(tmp_path)
+        led.record_fit_overflow("seg_0001")
+        led.clear_fit_overflow("seg_0001")
+        assert "seg_0001" not in led.entries()
+        # a real skip must be untouched by clear_fit_overflow
+        led.record_failure("seg_0002", "h", SIG_TTS_QA, reason="qa")
+        led.clear_fit_overflow("seg_0002")
+        assert led.entries()["seg_0002"]["status"] == "skipped"
+        # a CPS length_overflow must be untouched too
+        led.record_length_overflow("seg_0003")
+        led.clear_fit_overflow("seg_0003")
+        assert led.entries()["seg_0003"]["status"] == "length_overflow"
+
+
 class TestDurability:
     def test_ledger_survives_reload(self, tmp_path):
         led = _ledger(tmp_path)

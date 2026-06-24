@@ -110,6 +110,50 @@ def test_auto_missing_language_field_falls_back_loudly(state, monkeypatch, caplo
                for r in caplog.records)
 
 
+# --- U9: auto-LID mixed/low-confidence surfaced via asr/lid.json marker (B7/R9) ---
+
+def test_auto_mixed_detection_writes_lid_marker(state, monkeypatch):
+    toks = CANNED["tokens"]
+    payload = {"tokens": [{**t, "language": ("fr" if i else "de")}
+                          for i, t in enumerate(toks)]}
+    _mock_transcribe(monkeypatch, payload)
+    asr_mod.asr(state, _cfg(source_lang="auto"))
+    marker = json.loads((Path(state["workdir"]) / "asr" / "lid.json").read_text())
+    assert marker["degraded"] is True
+    assert marker["detected"] == "fr"   # majority
+
+
+def test_auto_missing_language_field_writes_lid_marker(state, monkeypatch):
+    _mock_transcribe(monkeypatch)        # CANNED has no per-token `language` field
+    asr_mod.asr(state, _cfg(source_lang="auto"))
+    marker = json.loads((Path(state["workdir"]) / "asr" / "lid.json").read_text())
+    assert marker["degraded"] is True
+    assert marker["detected"] == "en"    # loud fallback
+
+
+def test_auto_clean_detection_writes_no_lid_marker(state, monkeypatch):
+    payload = {"tokens": [{**t, "language": "fr"} for t in CANNED["tokens"]]}
+    _mock_transcribe(monkeypatch, payload)
+    asr_mod.asr(state, _cfg(source_lang="auto"))
+    assert not (Path(state["workdir"]) / "asr" / "lid.json").exists()
+
+
+def test_non_auto_run_writes_no_lid_marker(state, monkeypatch):
+    _mock_transcribe(monkeypatch)
+    asr_mod.asr(state, _cfg())           # default en, LID off, detector not called
+    assert not (Path(state["workdir"]) / "asr" / "lid.json").exists()
+
+
+def test_non_auto_run_clears_stale_lid_marker(state, monkeypatch):
+    # An earlier auto run leaves a degraded marker; a later non-auto run on the
+    # same workdir must clear it, never leave a stale agent-facing signal.
+    _mock_transcribe(monkeypatch)        # CANNED has no per-token language field
+    asr_mod.asr(state, _cfg(source_lang="auto"))
+    assert (Path(state["workdir"]) / "asr" / "lid.json").exists()
+    asr_mod.asr(state, _cfg())           # non-auto rerun, same workdir
+    assert not (Path(state["workdir"]) / "asr" / "lid.json").exists()
+
+
 def test_maps_tokens_to_words_in_seconds_with_speaker(state, monkeypatch):
     # R2/R3/R4: tokens -> words, ms -> s, joined word text, speaker captured.
     _mock_transcribe(monkeypatch)

@@ -505,6 +505,21 @@ class Config:
     duck_volume: float = 0.15
     # Max speed-up applied to TTS audio that overflows its subtitle slot
     max_tempo: float = 1.35
+    # Material-overrun band for the placement-layer length signal (U4/KTD7). An
+    # INTERIOR clip that still exceeds its slot AFTER the max_tempo cap has its
+    # spilled tail trimmed at the next segment's onset (fit, U2), dropping
+    # (capped - slot) of audio; a `fit_overflow` (report exit code 2, R3) is
+    # recorded only when the capped clip exceeds slot * fit_overflow_tolerance,
+    # i.e. when more than (tolerance - 1) of the slot's worth of audio was cut.
+    # 1.10 = flag a drop past ~10% of the slot, while a normal few-percent
+    # post-cap overrun (a clip just over the cap threshold) stays off exit 2.
+    # NOTE: the prior 1.5 was a dead band — at max_tempo=1.35 a clip up to ~2.0x
+    # its slot drops up to ~48% of the capped audio yet stayed BELOW 1.5*slot, so
+    # exit 2 never fired in exactly the speed-constrained case the signal targets.
+    # Tunable on real VI-run data (the last clip is gated separately on the
+    # timeline tail headroom). Distinct from slot_overflow_tolerance (the CPS
+    # re-translation escalation band): this one runs in `fit` for all languages.
+    fit_overflow_tolerance: float = 1.10
     # Placement of a clip that is SHORTER than its slot (U3/KTD3). "center"
     # nudges the clip forward by min(fit_max_center_offset, slack/2) so a short
     # VI clip no longer finishes early and reads as "ahead" of the picture;
@@ -628,6 +643,30 @@ class Config:
         chunking) read this one value so they can never diverge."""
         p = self.language_profile
         return self.tts_max_chunk_syllables if p.length_model == "syllable" else p.chunk_budget
+
+    @property
+    def srt_target_max_cue_chars(self) -> int:
+        """Per-language target-cue char budget for SRT tiling (U14/B11).
+
+        VI (syllable model) keeps the global `srt_max_cue_chars` so its subtitle
+        bytes are byte-identical (R19). CPS profiles take the TIGHTER of the global
+        cap and a reading-speed-derived ceiling — `cps_max` chars/sec over a
+        full-length cue (`srt_max_cue_dur`): a cue should not exceed cps_max*dur
+        characters or it reads too fast.
+
+        SURFACED INERT (B11 precondition): every shipped CPS profile carries
+        cps_max=17.0, and 17.0 * srt_max_cue_dur(6.0) = 102 >= the global
+        srt_max_cue_chars(84), so the global is binding and this is currently a
+        no-op for FR/ES — the call sites now read the profile budget, but making
+        R14 bite needs calibrated (lower, <~14) per-language cps_max values (a
+        deferred follow-up). The min() also guarantees the wiring can only ever
+        TIGHTEN, never loosen cues past today's default while values are
+        uncalibrated. Read at every target-SRT call site (translate/mux-burn/tts)
+        so the measured-loop re-render can never silently revert it."""
+        p = self.language_profile
+        if p.length_model == "syllable":
+            return self.srt_max_cue_chars
+        return min(self.srt_max_cue_chars, int(p.cps_max * self.srt_max_cue_dur))
 
     @property
     def measured_duration_active(self) -> bool:

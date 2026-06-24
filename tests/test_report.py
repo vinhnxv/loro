@@ -116,6 +116,15 @@ class TestBuildReport:
         assert report["skipped"] == {}
         assert report["crosscheck_replacements"] == []
         assert report["vision_degraded"] is None
+        assert report["asr_lid_degraded"] is None
+
+    def test_asr_lid_degraded_surfaced_from_marker(self, tmp_path):
+        # U9/R9: a mixed/low-confidence auto-LID marker becomes a top-level field.
+        (tmp_path / "asr").mkdir()
+        (tmp_path / "asr" / "lid.json").write_text(
+            json.dumps({"degraded": True, "detected": "en"}), encoding="utf-8")
+        report = rp.build_report(tmp_path)
+        assert report["asr_lid_degraded"]["detected"] == "en"
 
 
 class TestExitCode:
@@ -129,6 +138,22 @@ class TestExitCode:
     def test_abort_gives_three_fatal_gives_one(self, tmp_path):
         assert rp.exit_code(rp.build_report(tmp_path, status="aborted")) == 3
         assert rp.exit_code(rp.build_report(tmp_path, status="failed")) == 1
+
+    def test_fit_overflow_gives_two(self, tmp_path):
+        # U4/R3: a placement-layer overrun raises the exit code even on an
+        # otherwise-clean run.
+        SkipLedger(tmp_path).record_fit_overflow("seg_0019")
+        report = rp.build_report(tmp_path)
+        assert "seg_0019" in report["fit_overflows"]
+        assert rp.exit_code(report) == 2
+
+    def test_length_overflow_alone_stays_exit_zero(self, tmp_path):
+        # KTD2: a CPS best-effort length_overflow is surfaced but does NOT change
+        # the exit code, unlike fit_overflow.
+        SkipLedger(tmp_path).record_length_overflow("seg_0003")
+        report = rp.build_report(tmp_path)
+        assert report["length_overflows"] and not report["fit_overflows"]
+        assert rp.exit_code(report) == 0
 
 
 class TestConsoleSummary:
@@ -149,3 +174,24 @@ class TestConsoleSummary:
     def test_clean_summary(self, tmp_path):
         text = rp.console_summary(rp.build_report(tmp_path))
         assert "No segments were skipped" in text
+
+    def test_summary_lists_fit_overflow(self, tmp_path):
+        SkipLedger(tmp_path).record_fit_overflow("seg_0019")
+        text = rp.console_summary(rp.build_report(tmp_path))
+        assert "Fit overflow" in text
+        assert "seg_0019" in text
+
+    def test_fit_overflow_summary_omits_no_skips_all_clear(self, tmp_path):
+        # A fit_overflow-only run exits 2, so the "No segments were skipped."
+        # all-clear must not appear — it contradicted the exit code before.
+        SkipLedger(tmp_path).record_fit_overflow("seg_0019")
+        text = rp.console_summary(rp.build_report(tmp_path))
+        assert "Fit overflow" in text
+        assert "No segments were skipped" not in text
+
+    def test_summary_mentions_asr_lid_degraded(self, tmp_path):
+        (tmp_path / "asr").mkdir()
+        (tmp_path / "asr" / "lid.json").write_text(
+            json.dumps({"degraded": True, "detected": "en"}), encoding="utf-8")
+        text = rp.console_summary(rp.build_report(tmp_path))
+        assert "language detection uncertain" in text.lower()

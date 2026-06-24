@@ -422,6 +422,80 @@ class TestFailurePolicy:
         assert result["segments"][2].skipped is False
 
 
+class TestProgrammerErrorPropagation:
+    # U8/B5/R8: a genuine bug in the translation path must surface with a stack,
+    # not be silently swallowed as a per-segment content skip.
+
+    def test_batch_level_programmer_error_propagates_not_per_segment(self, env, monkeypatch):
+        def boom(cfg, messages, **kw):
+            env["sent"].append(messages)
+            raise KeyError("unexpected key")
+        monkeypatch.setattr(tr.llm, "chat", boom)
+        with pytest.raises(KeyError):
+            _run(env)
+        # propagated from the batch call; the per-segment fallback was never entered
+        assert len(env["sent"]) == 1
+
+    def test_per_segment_programmer_error_propagates(self, env, monkeypatch):
+        def boom(cfg, messages, **kw):
+            env["sent"].append(messages)
+            user = messages[-1]["content"]
+            lines = json.loads(user[user.rindex("[{"):])
+            if len(lines) > 1:
+                raise ValueError("batch parse fail")       # content -> per-segment retry
+            raise KeyError("unexpected per-segment key")   # programmer error -> propagate
+        monkeypatch.setattr(tr.llm, "chat", boom)
+        with pytest.raises(KeyError):
+            _run(env)
+
+    def test_infra_batch_error_skips_per_segment_with_infra_signature(self, env, monkeypatch):
+        # Regression: an infra StageError from the batch still short-circuits the
+        # per-segment fallback and records each segment with the infra signature.
+        from loro.harness.retry import StageError
+        def infra(cfg, messages, **kw):
+            env["sent"].append(messages)
+            raise StageError("translate", "infra", "timeout", "server down")
+        monkeypatch.setattr(tr.llm, "chat", infra)
+        result = _run(env, abort_threshold=99)   # keep the abort window out of the way
+        assert result["segments"][0].skipped
+        entry = SkipLedger(env["workdir"]).entries()["seg_0000"]
+        assert entry["signature"] == ["translate", "infra", "timeout"]
+        # one infra call per batch (2 batches), no per-segment retry storm
+        assert len(env["sent"]) == 2
+
+    def test_malformed_object_reply_is_content_skip_not_crash(self, env, monkeypatch):
+        # A reply that wraps the array in an OBJECT (or mis-keys items) is a model
+        # output-shape (content) failure, not a programmer bug: _translate_lines
+        # classifies it as content, so it degrades to a per-segment skip instead of
+        # crashing the run with a TypeError.
+        def wrapper(cfg, messages, **kw):
+            env["sent"].append(messages)
+            user = messages[-1]["content"]
+            lines = json.loads(user[user.rindex("[{"):])
+            return json.dumps({"translations": [{"i": l["i"], "vi": f"x{l['i']}"}
+                                                 for l in lines]})
+        monkeypatch.setattr(tr.llm, "chat", wrapper)
+        result = _run(env, abort_threshold=99)        # must NOT raise
+        assert result["segments"][0].skipped
+        entry = SkipLedger(env["workdir"]).entries()["seg_0000"]
+        assert entry["signature"][1] == "content"     # not a propagated crash
+
+    def test_empty_string_translation_records_content_skip(self, env, monkeypatch):
+        # Regression: a valid-shape reply with empty translations raises the
+        # explicit "no translation returned" ValueError -> recorded as content.
+        def empty(cfg, messages, **kw):
+            env["sent"].append(messages)
+            user = messages[-1]["content"]
+            lines = json.loads(user[user.rindex("[{"):])
+            return json.dumps([{"i": l["i"], "vi": ""} for l in lines], ensure_ascii=False)
+        monkeypatch.setattr(tr.llm, "chat", empty)
+        result = _run(env, abort_threshold=99)      # keep the abort window out of the way
+        assert result["segments"][0].skipped
+        assert result["segments"][0].skip_reason == "translate_failed"
+        entry = SkipLedger(env["workdir"]).entries()["seg_0000"]
+        assert entry["signature"][1] == "content"   # ValueError -> content class
+
+
 def test_source_equals_target_reuses_source_srt_without_clobber(tmp_path, monkeypatch):
     # R11/#7: a voice-replacement run (source==target) skips the LLM, sets the
     # target text to the source text, and must NOT clobber the word-timed source
