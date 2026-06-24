@@ -260,6 +260,48 @@ def test_cleanup_off_fires_no_delete(http):
     assert [c for c in http.calls if c[0] == "delete"] == []
 
 
+# --- U6: server-side cleanup on every exit path (B6/R6/KTD4) ---
+
+def _deleted(http):
+    return {c[1] for c in http.calls if c[0] == "delete"}
+
+
+def test_cleanup_fires_when_poll_raises_after_create(http):
+    http.poll_responses = [_Resp(200, {"status": "error", "error_message": "no audio"})]
+    with pytest.raises(StageError):
+        stt.transcribe(_cfg(soniox_stt_cleanup=True), http.audio)
+    assert _deleted(http) == {"https://api.soniox.com/v1/transcriptions/tr-1",
+                              "https://api.soniox.com/v1/files/file-1"}
+
+
+def test_cleanup_fires_when_transcript_fetch_raises(http):
+    http.poll_responses = [_Resp(200, {"status": "completed"})]
+    http.transcript_responses = [_Resp(422, text="bad")]
+    with pytest.raises(StageError):
+        stt.transcribe(_cfg(soniox_stt_cleanup=True), http.audio)
+    assert _deleted(http) == {"https://api.soniox.com/v1/transcriptions/tr-1",
+                              "https://api.soniox.com/v1/files/file-1"}
+
+
+def test_upload_failure_runs_finally_without_nameerror_and_no_deletes(http):
+    http.upload_responses = [_Resp(401, payload={"error_type": "unauthorized"},
+                                   text='{"error_type":"unauthorized"}')]
+    with pytest.raises(StageError) as exc_info:
+        stt.transcribe(_cfg(soniox_stt_cleanup=True), http.audio)
+    assert exc_info.value.code == "unauthorized"   # the upload error propagates
+    assert _deleted(http) == set()                 # nothing uploaded -> nothing to delete
+
+
+def test_delete_failure_does_not_mask_original_exception(http):
+    import requests as _requests
+    http.poll_responses = [_Resp(200, {"status": "error", "error_message": "no audio"})]
+    # the first cleanup delete itself errors; the ORIGINAL poll error must win
+    http.delete_responses = [_requests.ConnectionError("refused"), _Resp(200, {})]
+    with pytest.raises(StageError) as exc_info:
+        stt.transcribe(_cfg(soniox_stt_cleanup=True), http.audio)
+    assert exc_info.value.code == "soniox_error"   # not the delete ConnectionError
+
+
 def test_failed_delete_does_not_fail_transcribe(http, caplog):
     import requests as _requests
     http.poll_responses = [_Resp(200, {"status": "completed"})]

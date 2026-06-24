@@ -230,14 +230,25 @@ def transcribe(cfg: Config, audio_path: str | Path, language_hints=None,
     resolved effective values for source_lang="auto" (U7)."""
     context = _build_context(cfg)
     duration = ffmpeg.probe_duration(audio_path)
-    file_id = _upload(cfg, audio_path)
-    transcription_id = _create(cfg, file_id, context, language_hints,
-                               enable_language_identification)
-    log.info("Soniox STT transcription %s created; polling", transcription_id)
-    _poll(cfg, transcription_id, duration)
-    transcript = _fetch_transcript(cfg, transcription_id)
-    if cfg.soniox_stt_cleanup:
-        _delete(cfg, f"{cfg.soniox_stt_base_url}/v1/transcriptions/{transcription_id}",
-                "transcription")
-        _delete(cfg, f"{cfg.soniox_stt_base_url}/v1/files/{file_id}", "uploaded file")
-    return transcript
+    # Honor the README/privacy promise on EVERY exit path (B6/R6/KTD4): the two
+    # server-side ids are deleted in a `finally` so an exception after upload (a
+    # poll/fetch failure) still cleans up, not only the happy path. The ids start
+    # None and are assigned as each call returns, so the finally never NameErrors
+    # on an unbound id (e.g. when _upload itself raises) and can't mask the
+    # original exception; _delete is already best-effort/non-fatal.
+    file_id = None
+    transcription_id = None
+    try:
+        file_id = _upload(cfg, audio_path)
+        transcription_id = _create(cfg, file_id, context, language_hints,
+                                   enable_language_identification)
+        log.info("Soniox STT transcription %s created; polling", transcription_id)
+        _poll(cfg, transcription_id, duration)
+        return _fetch_transcript(cfg, transcription_id)
+    finally:
+        if cfg.soniox_stt_cleanup:
+            if transcription_id is not None:
+                _delete(cfg, f"{cfg.soniox_stt_base_url}/v1/transcriptions/{transcription_id}",
+                        "transcription")
+            if file_id is not None:
+                _delete(cfg, f"{cfg.soniox_stt_base_url}/v1/files/{file_id}", "uploaded file")
