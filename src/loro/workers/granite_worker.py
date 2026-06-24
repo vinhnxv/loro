@@ -32,6 +32,32 @@ MODEL_ID = "ibm-granite/granite-speech-4.1-2b"
 DEFAULT_PROMPT = "transcribe the speech with proper punctuation and capitalization."
 
 
+def _select_dtype(torch, device: str):
+    """Pick the model + audio-feature dtype (B8/R11). MPS does NOT reliably
+    support bfloat16 for the audio-feature cast — it raised on real hosts — so MPS
+    uses float16 (same memory as bf16, and MPS-supported) instead; CPU stays
+    float32. Takes `torch` as a parameter so the selection is unit-testable
+    without importing the heavy torch stack."""
+    return torch.float16 if device == "mps" else torch.float32
+
+
+def _load_model(model_cls, model_id: str, device: str, dtype, fallback_dtype):
+    """Load the model at `dtype`, degrading to `fallback_dtype` (with a stderr
+    warning) if the device rejects the dtype — e.g. an unsupported-dtype error on
+    an older MPS backend — rather than aborting the whole verify run (R11).
+    Returns (model, dtype_used) so the feature cast matches the loaded dtype."""
+    try:
+        model = model_cls.from_pretrained(
+            model_id, dtype=dtype, low_cpu_mem_usage=True).to(device)
+        return model, dtype
+    except (RuntimeError, TypeError) as exc:
+        print(f"granite worker: dtype {dtype} unsupported on {device} ({exc}); "
+              f"falling back to {fallback_dtype}", file=sys.stderr, flush=True)
+        model = model_cls.from_pretrained(
+            model_id, dtype=fallback_dtype, low_cpu_mem_usage=True).to(device)
+        return model, fallback_dtype
+
+
 def main() -> None:
     wav_paths = sys.argv[1:]
     if not wav_paths:
@@ -47,13 +73,12 @@ def main() -> None:
     from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
 
     device = "mps" if torch.backends.mps.is_available() else "cpu"
-    # bfloat16: same memory as float16 with a larger exponent range
-    dtype = torch.bfloat16 if device == "mps" else torch.float32
     print(f"loading {model_id} on {device}...", file=sys.stderr)
     processor = AutoProcessor.from_pretrained(model_id)
-    model = AutoModelForSpeechSeq2Seq.from_pretrained(
-        model_id, dtype=dtype, low_cpu_mem_usage=True
-    ).to(device)
+    # MPS-safe dtype (float16, not bfloat16) with a float32 fallback if the device
+    # still rejects it, so a verify run degrades instead of crashing (B8/R11).
+    model, dtype = _load_model(AutoModelForSpeechSeq2Seq, model_id, device,
+                               _select_dtype(torch, device), torch.float32)
     model.eval()
 
     messages = [{"role": "user", "content": f"<|audio|> {prompt}"}]

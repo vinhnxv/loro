@@ -122,3 +122,57 @@ class TestGraniteWorkerProtocol:
 
 
 PROMPT_X = "transcribe the speech with proper punctuation and capitalization."
+
+
+# --- U11: MPS dtype selection + unsupported-dtype fallback (B8/R11) ---
+# The real worker imports torch only inside main(), so the dtype helpers are
+# unit-testable here with lightweight fakes (no torch/transformers needed).
+
+from loro.workers import granite_worker as gw
+
+
+class _FakeTorch:
+    bfloat16 = "bfloat16"
+    float16 = "float16"
+    float32 = "float32"
+
+
+class TestGraniteDtype:
+    def test_mps_avoids_bfloat16(self):
+        torch = _FakeTorch()
+        chosen = gw._select_dtype(torch, "mps")
+        assert chosen != torch.bfloat16        # bf16 is the unsupported one
+        assert chosen == torch.float16         # MPS-safe, memory-efficient
+
+    def test_cpu_dtype_unchanged(self):
+        assert gw._select_dtype(_FakeTorch(), "cpu") == _FakeTorch.float32
+
+    def test_load_model_falls_back_on_unsupported_dtype(self):
+        calls = []
+
+        class FakeModel:
+            def to(self, device):
+                return self
+
+        class FakeCls:
+            def from_pretrained(self, model_id, dtype=None, low_cpu_mem_usage=None):
+                calls.append(dtype)
+                if dtype == "float16":
+                    raise RuntimeError("dtype float16 not supported on this backend")
+                return FakeModel()
+
+        model, used = gw._load_model(FakeCls(), "id", "mps", "float16", "float32")
+        assert used == "float32"               # degraded, not crashed
+        assert calls == ["float16", "float32"]  # tried preferred, then fell back
+
+    def test_load_model_keeps_preferred_dtype_when_supported(self):
+        class FakeModel:
+            def to(self, device):
+                return self
+
+        class FakeCls:
+            def from_pretrained(self, model_id, dtype=None, low_cpu_mem_usage=None):
+                return FakeModel()
+
+        _, used = gw._load_model(FakeCls(), "id", "cpu", "float32", "float32")
+        assert used == "float32"
