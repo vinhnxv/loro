@@ -116,6 +116,15 @@ class TestBuildReport:
         assert report["skipped"] == {}
         assert report["crosscheck_replacements"] == []
         assert report["vision_degraded"] is None
+        assert report["asr_lid_degraded"] is None
+
+    def test_asr_lid_degraded_surfaced_from_marker(self, tmp_path):
+        # U9/R9: a mixed/low-confidence auto-LID marker becomes a top-level field.
+        (tmp_path / "asr").mkdir()
+        (tmp_path / "asr" / "lid.json").write_text(
+            json.dumps({"degraded": True, "detected": "en"}), encoding="utf-8")
+        report = rp.build_report(tmp_path)
+        assert report["asr_lid_degraded"]["detected"] == "en"
 
 
 class TestExitCode:
@@ -171,3 +180,10 @@ class TestConsoleSummary:
         text = rp.console_summary(rp.build_report(tmp_path))
         assert "Fit overflow" in text
         assert "seg_0019" in text
+
+    def test_summary_mentions_asr_lid_degraded(self, tmp_path):
+        (tmp_path / "asr").mkdir()
+        (tmp_path / "asr" / "lid.json").write_text(
+            json.dumps({"degraded": True, "detected": "en"}), encoding="utf-8")
+        text = rp.console_summary(rp.build_report(tmp_path))
+        assert "language detection uncertain" in text.lower()

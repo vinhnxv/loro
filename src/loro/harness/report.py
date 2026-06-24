@@ -114,6 +114,21 @@ def _vision_degraded(workdir: Path) -> dict | None:
     return None
 
 
+def _asr_lid_degraded(workdir: Path) -> dict | None:
+    """Surface a mixed / low-confidence Soniox `--source-lang auto` detection
+    (B7/R9) from the durable asr/lid.json marker the soniox provider writes —
+    auditable without scanning logs. Parallel to _vision_degraded."""
+    try:
+        data = json.loads((workdir / "asr" / "lid.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if data.get("degraded"):
+        return {"detected": data.get("detected", "unknown"),
+                "hint": "--source-lang auto detection was mixed or low-confidence; "
+                        "verify the source language and re-run if wrong"}
+    return None
+
+
 def _overrides_status(workdir: Path, valid_ids: set[str] | None) -> dict | None:
     """Surface which override keys actually match current segments, so a
     re-segmented ASR run makes misapplied overrides visible."""
@@ -183,6 +198,7 @@ def build_report(
         "crosscheck_sub_rejected": crosscheck["sub_rejected"],
         "crosscheck_summary": crosscheck["summary"],
         "vision_degraded": _vision_degraded(workdir),
+        "asr_lid_degraded": _asr_lid_degraded(workdir),
         "overrides": _overrides_status(workdir, valid_ids),
         "stage_timings_sec": {k: round(v, 2) for k, v in (stage_timings or {}).items()},
         "abort": abort_info,
@@ -278,6 +294,11 @@ def console_summary(report: dict) -> str:
     if report["vision_degraded"]:
         lines.append(f"Vision degraded: {report['vision_degraded']['reason']} "
                      f"({report['vision_degraded']['hint']})")
+
+    if report.get("asr_lid_degraded"):
+        lines.append(f"ASR language detection uncertain (detected "
+                     f"{report['asr_lid_degraded']['detected']}): "
+                     f"{report['asr_lid_degraded']['hint']}")
 
     if report.get("overrides") and report["overrides"]["unmatched"]:
         lines.append("WARNING: override matches no existing segment: "
