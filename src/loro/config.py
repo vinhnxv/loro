@@ -505,6 +505,16 @@ class Config:
     duck_volume: float = 0.15
     # Max speed-up applied to TTS audio that overflows its subtitle slot
     max_tempo: float = 1.35
+    # Material-overrun band for the placement-layer length signal (U4/KTD7). A
+    # clip that still exceeds its slot AFTER the max_tempo cap has its spilled
+    # tail trimmed at the next segment's onset (fit, U2), dropping audio; only
+    # when the capped clip exceeds slot * fit_overflow_tolerance AND that trim
+    # actually dropped audio is a `fit_overflow` recorded (report exit code 2,
+    # R3). Deliberately WIDE so exit 2 stays signal, not noise, on long videos
+    # where a ~4% post-cap overrun is normal — tighten on real-run data, mirroring
+    # slot_overflow_tolerance. Distinct from slot_overflow_tolerance (the CPS
+    # re-translation escalation band): this one runs in `fit` for all languages.
+    fit_overflow_tolerance: float = 1.5
     # Placement of a clip that is SHORTER than its slot (U3/KTD3). "center"
     # nudges the clip forward by min(fit_max_center_offset, slack/2) so a short
     # VI clip no longer finishes early and reads as "ahead" of the picture;

@@ -26,6 +26,13 @@ from loro.utils import ffmpeg
 
 log = logging.getLogger("loro.fit")
 
+# Placement-policy version, folded into the dub fingerprint (U2). Bump this
+# whenever the timeline-placement logic changes shape, so an existing
+# dub.<lang>.wav cached under the old policy is invalidated and rebuilt once.
+# 1 = pre-U2 (over-cap clips kept onset and summed over the next segment);
+# 2 = U2 (interior over-cap spill trimmed at the next segment's onset).
+PLACEMENT_POLICY = 2
+
 
 def _slot_end(segments: list[Segment], i: int, video_duration: float) -> float:
     if i + 1 < len(segments):
@@ -112,6 +119,14 @@ def fit(state: DubState, cfg: Config) -> DubState:
         # changing alignment/offset rebuilds dub.vi.wav and the mux (R17).
         "fit_alignment": cfg.fit_alignment,
         "fit_max_center_offset": cfg.fit_max_center_offset,
+        # U2: the over-cap spill-trim changes the placed samples of over-cap
+        # clips without changing placed_at, so it would be a silent cache HIT on
+        # exactly the resumed runs that hit the overlap bug. The policy version
+        # AND the tolerance value (U4 reprobes the fit_overflow decision against
+        # the current tolerance on every call) are in the fingerprint so changing
+        # either invalidates a stale over-cap dub and forces one rebuild.
+        "placement_policy": PLACEMENT_POLICY,
+        "fit_overflow_tolerance": cfg.fit_overflow_tolerance,
     }
     if cfg.original_audio == "replace" and any_skip:
         # Skip slots carry original audio: its content shapes the dub (R23)
@@ -138,7 +153,8 @@ def fit(state: DubState, cfg: Config) -> DubState:
 
             clip_dur = ffmpeg.probe_duration(seg.tts_wav)
             slot = slot_end - seg.start
-            if clip_dur <= slot or slot <= 0:
+            overflow = clip_dur > slot and slot > 0
+            if not overflow:
                 seg.fitted_wav = seg.tts_wav
                 # Short clip: center it (capped) so it doesn't finish early.
                 seg.placed_at = _placement(seg.start, slot_end, clip_dur, cfg)
@@ -151,6 +167,17 @@ def fit(state: DubState, cfg: Config) -> DubState:
                          seg.index, clip_dur, slot, factor)
                 seg.placed_at = seg.start  # overflow: keep onset, let it spill
             audio = _read_mono_at(seg.fitted_wav, sr, fit_dir)
+            # A clip that still overruns its slot after the tempo cap must not sum
+            # on top of the next segment's clip region (B2/R1): trim the spilled
+            # tail at the next segment's onset so overlapping samples are never
+            # summed. Geometry, not occupancy — the interior overrun is trimmed
+            # even when the next slot is empty (duck-skipped), so placement is
+            # mode-independent and stable on a cache-hit reprobe (KTD7). The LAST
+            # segment is never trimmed: its tail spills into genuine trailing
+            # silence (the +1.0s headroom) and mux preserves it (U3/R2).
+            if overflow and i + 1 < len(segments):
+                writable = max(0, int(round(slot * sr)))
+                audio = audio[:writable]
             _place(timeline, _fade(audio, sr, cfg.fade_ms), seg.placed_at, sr)
 
         np.clip(timeline, -1.0, 1.0, out=timeline)

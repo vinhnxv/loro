@@ -171,6 +171,86 @@ def test_alignment_change_rebuilds_dub(tmp_path):
     assert not np.array_equal(dub_center[: int(0.5 * sr)], dub_start[: int(0.5 * sr)])
 
 
+# --- U2: over-cap spill must not overlap the next segment (B2/R1) ---
+
+def test_overflow_clip_trimmed_at_next_segment_onset(tmp_path):
+    # Clip 0 overruns its 1.0s slot even at max_tempo and would spill into
+    # segment 1's region; the spilled tail is trimmed at seg 1's onset so the two
+    # clips never sum. Proven by isolating each clip's footprint (the other slot
+    # skipped): no sample is non-zero in both, and clip 0 is silent past its slot.
+    long0 = tmp_path / "c0.wav"
+    clip1 = tmp_path / "c1.wav"
+    _tone(long0, 3.0, freq=440.0)
+    _tone(clip1, 0.8, freq=880.0)
+
+    def make(workdir, skip0=False, skip1=False):
+        s0 = (Segment(index=0, start=0.0, end=1.0, text_src="a", skipped=True, skip_reason="qa")
+              if skip0 else
+              Segment(index=0, start=0.0, end=1.0, text_src="a", text_target="a", tts_wav=str(long0)))
+        s1 = (Segment(index=1, start=1.0, end=2.0, text_src="b", skipped=True, skip_reason="qa")
+              if skip1 else
+              Segment(index=1, start=1.0, end=2.0, text_src="b", text_target="b", tts_wav=str(clip1)))
+        wd = tmp_path / workdir
+        wd.mkdir()
+        return {"segments": [s0, s1], "workdir": str(wd), "video_duration": 2.0}
+
+    cfg = Config(max_tempo=1.35)
+    clip0_only, sr = sf.read(fit(make("a", skip1=True), cfg)["dub_wav"])
+    clip1_only, _ = sf.read(fit(make("b", skip0=True), cfg)["dub_wav"])
+    eps = 1e-4
+    both_loud = (np.abs(clip0_only) > eps) & (np.abs(clip1_only) > eps)
+    assert not both_loud.any()                              # no summation overlap
+    assert np.abs(clip0_only[int(1.05 * sr):]).max() < eps  # trimmed at slot end
+
+
+def test_trailing_overflow_clip_spills_into_trailing_silence(tmp_path):
+    # The LAST clip is never trimmed — its over-cap tail spills past
+    # video_duration into the +1.0s headroom (audible), preserved for mux (U3/R2).
+    clip = tmp_path / "c.wav"
+    _tone(clip, 2.0)
+    seg = Segment(index=0, start=0.0, end=1.0, text_src="a", text_target="a", tts_wav=str(clip))
+    state = {"segments": [seg], "workdir": str(tmp_path), "video_duration": 1.0}
+    dub, sr = sf.read(fit(state, Config(max_tempo=1.35))["dub_wav"])
+    # capped clip = 2.0/1.35 ≈ 1.48s placed at 0.0 -> audible past video_duration
+    assert np.abs(dub[int(1.1 * sr):int(1.4 * sr)]).max() > 0.1
+
+
+def test_no_overflow_run_is_cache_stable(tmp_path):
+    # VI regression: the U2 trim only touches over-cap clips, so a no-overflow run
+    # is unchanged and reruns from cache with byte-identical output.
+    clip = tmp_path / "c.wav"
+    _tone(clip, 1.0)
+
+    def make():
+        return {"segments": [Segment(index=0, start=0.0, end=2.0, text_src="a",
+                                     text_target="a", tts_wav=str(clip))],
+                "workdir": str(tmp_path), "video_duration": 2.0}
+
+    dub1, sr = sf.read(fit(make(), Config())["dub_wav"])
+    dub2, _ = sf.read(fit(make(), Config())["dub_wav"])
+    assert np.array_equal(dub1, dub2)
+
+
+def test_fit_overflow_tolerance_change_busts_dub_cache(tmp_path):
+    # The tolerance is in the dub fingerprint (U2): editing it must invalidate an
+    # existing over-cap dub so a U4 reprobe never claims an overrun the cached
+    # bytes don't reflect.
+    clip = tmp_path / "c.wav"
+    _tone(clip, 1.0)
+
+    def make():
+        return {"segments": [Segment(index=0, start=0.0, end=2.0, text_src="a",
+                                     text_target="a", tts_wav=str(clip))],
+                "workdir": str(tmp_path), "video_duration": 2.0}
+
+    fit(make(), Config(fit_overflow_tolerance=1.5))
+    fp1 = artifacts.read_meta(tmp_path / "fit" / "dub.vi.wav")["input_fingerprint"]
+    fit(make(), Config(fit_overflow_tolerance=1.5))          # same tol -> stable
+    assert artifacts.read_meta(tmp_path / "fit" / "dub.vi.wav")["input_fingerprint"] == fp1
+    fit(make(), Config(fit_overflow_tolerance=2.0))          # changed -> rebuild
+    assert artifacts.read_meta(tmp_path / "fit" / "dub.vi.wav")["input_fingerprint"] != fp1
+
+
 def _orig_audio(tmp_path, seconds=4.0, sr=44100):
     path = tmp_path / "audio_orig.wav"
     t = np.linspace(0, seconds, int(sr * seconds), endpoint=False)
