@@ -56,6 +56,12 @@ class TestDeriveWorkdirStem:
     def test_youtube_embed_url_extracts_video_id(self):
         assert derive_workdir_stem("https://www.youtube.com/embed/l6KeLCuB90o") == "l6KeLCuB90o"
 
+    def test_youtube_embed_url_with_trailing_path_no_slash_in_stem(self):
+        # /embed/abc123/playlist should extract only "abc123", not "abc123/playlist"
+        stem = derive_workdir_stem("https://www.youtube.com/embed/abc123/playlist")
+        assert stem == "abc123"
+        assert "/" not in stem
+
     def test_non_youtube_url_returns_12_char_hash(self):
         url = "https://vimeo.com/123456789"
         stem = derive_workdir_stem(url)

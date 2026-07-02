@@ -284,11 +284,8 @@ def test_lock_loss_exits_one_without_touching_report(env):
 
 @pytest.fixture
 def url_env(tmp_path, monkeypatch):
-    """Fixture for URL input tests: mocks preflight, download, and build_graph."""
+    """Fixture for URL input tests: mocks preflight and download."""
     workdir = tmp_path / "work"
-    downloaded_file = tmp_path / "downloaded" / "source.mp4"
-    downloaded_file.parent.mkdir(parents=True, exist_ok=True)
-    downloaded_file.write_bytes(b"\x00" * 64)
 
     monkeypatch.setattr(cli, "preflight", lambda cfg, video, wd: None)
 
@@ -301,7 +298,7 @@ def url_env(tmp_path, monkeypatch):
 
     monkeypatch.setattr(cli, "ytdl_download", mock_download)
 
-    return {"workdir": workdir, "downloaded_file": downloaded_file, "monkeypatch": monkeypatch}
+    return {"workdir": workdir, "monkeypatch": monkeypatch}
 
 
 def test_url_input_graph_receives_downloaded_path(url_env, monkeypatch):
@@ -337,7 +334,8 @@ def test_file_path_input_backward_compat_no_download(url_env, monkeypatch):
 
     monkeypatch.setattr(cli, "ytdl_download", mock_download)
 
-    video_path = url_env["downloaded_file"]  # reuse as a local file
+    video_path = url_env["workdir"].parent / "local.mp4"
+    video_path.write_bytes(b"\x00" * 64)
     class _Ok:
         def __init__(self, cfg, timings=None):
             pass

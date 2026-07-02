@@ -44,9 +44,10 @@ def derive_workdir_stem(url: str) -> str:
             vid = parsed.path.strip("/").split("/")[0]
             if vid:
                 return vid
-        # youtube.com/embed/<id>
+        # youtube.com/embed/<id> — take only the first path segment after
+        # /embed/ to avoid nested workdir paths (e.g. /embed/abc123/playlist)
         if "/embed/" in parsed.path:
-            seg = parsed.path.split("/embed/")[-1].strip("/")
+            seg = parsed.path.split("/embed/")[-1].strip("/").split("/")[0]
             if seg:
                 return seg
         # youtube.com/watch?v=<id>
