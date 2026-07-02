@@ -68,18 +68,25 @@ def with_retry(
     base_delay: float = 1.0,
     max_delay: float = 30.0,
     retry_classes: tuple[str, ...] = (INFRA,),
+    retry_codes: tuple[str, ...] = (),
     sleep: Callable[[float], None] = time.sleep,
 ) -> T:
     """Run `fn`, retrying retryable classes with exponential backoff + jitter.
 
     Raises StageError carrying the (stage, class, code) signature once
-    exhausted or on a non-retryable class.
+    exhausted or on a non-retryable class. `retry_codes` extends retry to
+    specific StageError codes whose class is otherwise non-retryable — e.g. a
+    nondeterministic LLM that intermittently returns empty content
+    (content/empty_response): retrying the same prompt can yield a non-empty
+    reply, so the caller opts that code into retry without reclassifying it
+    (the StageError keeps its original class for ledger/abort semantics).
     """
     for attempt in range(attempts):
         try:
             return fn()
         except StageError as err:
-            if err.error_class not in retry_classes or attempt == attempts - 1:
+            retryable = err.error_class in retry_classes or err.code in retry_codes
+            if not retryable or attempt == attempts - 1:
                 raise
         except Exception as exc:
             error_class, code = classify(exc)
