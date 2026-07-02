@@ -146,7 +146,13 @@ def _translate_lines(cfg: Config, profile, lines: list[dict],
         [{"role": "system", "content": profile.system_prompt},
          {"role": "user", "content": user}],
         temperature=TEMPERATURE,
-        max_tokens=4096,
+        # 8192 (not 4096): a thinking model served via Ollama Cloud (qwen3.5)
+        # burns hundreds-thousands of invisible completion tokens per call on
+        # top of the actual JSON; 4096 truncated the 12-segment batch (finish=
+        # length -> empty_response -> abort window). 8192 covers a full batch's
+        # hidden burn + answer. A non-thinking model (Gemma) stops early and
+        # never uses the headroom, so this is free locally.
+        max_tokens=8192,
         stage="translate",
         role=cfg.llm_role("translate"),
         enable_thinking=False,

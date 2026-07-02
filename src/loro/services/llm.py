@@ -49,6 +49,8 @@ def chat(
 
     def call() -> str:
         extra: dict = {}
+        target = host or cfg.llm_host
+        is_ollama = "ollama.com" in (target or "").lower()
         if not enable_thinking:
             # Qwen-style models leak <think> blocks that burn max_tokens and can
             # truncate / confuse extract_json. Disable thinking via the chat
@@ -56,12 +58,33 @@ def chat(
             # verified against the live oMLX at impl time (/no_think in the
             # prompt is the documented fallback); Gemma ignores the unknown
             # template kwarg, so this is safe on the default path.
-            extra["extra_body"] = {"chat_template_kwargs": {"enable_thinking": False}}
+            # Ollama Cloud does NOT honor chat_template_kwargs (an oMLX/llama.cpp
+            # mechanism; an unknown chat_template_kwargs there makes the request
+            # hang). Its native toggle extra_body={"think": False} is accepted
+            # but, empirically on qwen3.5:397b, BACKFIRES — it consumes MORE
+            # completion tokens (1305 vs 270 with no toggle) while still
+            # emitting clean content (the think block is not leaked into content
+            # on this serving, it is burned invisibly). So for ollama.com we send
+            # NO extra_body (fewest hidden tokens, clean content) and instead
+            # floor max_tokens below to absorb the hidden burn. Local oMLX/
+            # llama.cpp keeps the chat_template_kwargs path. Generalize by
+            # adding another host here if a different cloud provider needs its
+            # own toggle.
+            if not is_ollama:
+                extra["extra_body"] = {"chat_template_kwargs": {"enable_thinking": False}}
+        eff_max_tokens = max_tokens
+        if is_ollama:
+            # qwen3.5:397b on Ollama Cloud burns 270-1300+ invisible completion
+            # tokens per call (the think toggle cannot disable it). Floor the
+            # budget so small-node calls (context=160, seg_visual=256,
+            # vision=512) do not hit finish=length with empty content. The
+            # actual answer is small; the floor only absorbs the hidden burn.
+            eff_max_tokens = max(max_tokens, 2048)
         response = client(cfg, host=host, api_key=api_key).chat.completions.create(
             model=model or cfg.llm_model,
             messages=messages,
             temperature=temperature,
-            max_tokens=max_tokens,
+            max_tokens=eff_max_tokens,
             **extra,
         )
         # Some quantized models occasionally return null content; surface it
@@ -72,7 +95,15 @@ def chat(
                              "model returned no content")
         return content.strip()
 
-    return with_retry(stage, call, attempts=cfg.retry_attempts, base_delay=cfg.retry_base_delay)
+    # Retry empty_response in addition to infra: a nondeterministic LLM
+    # (e.g. qwen3.5 on Ollama Cloud) intermittently returns empty content for a
+    # structured call, and retrying the same prompt commonly yields a non-empty
+    # reply. The StageError keeps class=content for ledger/abort semantics
+    # (ACCEPTABLE_CLASSES), so this only adds retry chances, it does not
+    # reclassify the failure as infra.
+    return with_retry(stage, call, attempts=cfg.retry_attempts,
+                      base_delay=cfg.retry_base_delay,
+                      retry_codes=("empty_response",))
 
 
 def list_models(cfg: Config, timeout: float | None = None,
