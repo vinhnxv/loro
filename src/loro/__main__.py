@@ -2,6 +2,11 @@
 
     loro input.mp4 [-o output.mp4] [--no-vision] [--no-cross-check]
                    [--no-seg-visual] [--no-summary] [--original-audio duck|replace]
+    loro https://www.youtube.com/watch?v=<id> [-o output.mp4] ...
+
+Both local file paths and URLs (http/https) are accepted as the ``video``
+positional argument. URL inputs are downloaded via yt-dlp before the
+pipeline runs; all yt-dlp-supported platforms work (R9).
 
 Exit codes (R25): 0 completed clean; 2 completed with skipped/accepted-skipped
 segments OR placement-layer fit_overflows (a dub clip materially overran its slot
@@ -23,7 +28,8 @@ from loro.harness import report as report_mod
 from loro.harness.artifacts import LockError, WorkdirLock
 from loro.harness.ledger import AbortRun
 from loro.harness.preflight import PreflightError, preflight
-
+from loro.services.ytdl import download as ytdl_download, sanitize_title
+from loro.utils.url import is_url, derive_workdir_stem
 log = logging.getLogger("loro")
 
 
@@ -105,17 +111,45 @@ def main() -> None:
         ref_text=args.ref_text,
         **engine_override,
     )
-    workdir = Path(args.workdir) if args.workdir else cfg.workdir / Path(args.video).stem
+    # --- URL vs file path input (U3) ---
+    # When the input is a URL, download the video before preflight so the rest
+    # of the pipeline always works on a local file (KTD2). Local file paths
+    # continue unchanged (R3).
+    video_input = args.video
+    download_meta = None
+    if is_url(video_input):
+        # Derive workdir stem from the URL (KTD3) unless the user overrode -w
+        if args.workdir:
+            workdir = Path(args.workdir)
+        else:
+            workdir = cfg.workdir / derive_workdir_stem(video_input)
+        workdir.mkdir(parents=True, exist_ok=True)
+        try:
+            download_meta = ytdl_download(video_input, workdir / "ingest", cfg=cfg)
+        except RuntimeError as exc:
+            print(exc, file=sys.stderr)
+            sys.exit(1)
+        video_path = download_meta["path"]
+        log.info("downloaded %s -> %s", video_input, video_path)
+    else:
+        workdir = Path(args.workdir) if args.workdir else cfg.workdir / Path(video_input).stem
+        video_path = video_input
 
     try:
-        preflight(cfg, args.video, workdir)
+        preflight(cfg, video_path, workdir)
     except PreflightError as exc:
         print(exc, file=sys.stderr)
         sys.exit(1)
 
-    graph_state = {"video_path": args.video, "workdir": str(workdir)}
+    graph_state = {"video_path": video_path, "workdir": str(workdir)}
     if args.output:
         graph_state["output_path"] = args.output
+    elif download_meta is not None:
+        # Output naming for URL inputs: derive from the video title or video ID
+        # (R7). Falls back to video_id when title is empty.
+        title = sanitize_title(download_meta["title"]) or download_meta["video_id"]
+        if title:
+            graph_state["output_path"] = str(workdir / f"{title}.{cfg.target_lang.lower()}.mp4")
 
     timings: dict[str, float] = {}
     graph = build_graph(cfg, timings=timings)
