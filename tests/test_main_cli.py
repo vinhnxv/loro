@@ -2,6 +2,7 @@
 
 import json
 import logging
+from pathlib import Path
 
 import pytest
 
@@ -277,3 +278,242 @@ def test_lock_loss_exits_one_without_touching_report(env):
     assert env["run"](lambda s: {}) == 1
     # The live run's workdir must not be written to
     assert not (env["workdir"] / "report.json").exists()
+
+
+# --- URL input support (U3) ---
+
+@pytest.fixture
+def url_env(tmp_path, monkeypatch):
+    """Fixture for URL input tests: mocks preflight and download."""
+    workdir = tmp_path / "work"
+
+    monkeypatch.setattr(cli, "preflight", lambda cfg, video, wd: None)
+
+    def mock_download(url, dest_dir, cfg=None):
+        # Ensure the file exists at the expected path
+        p = Path(dest_dir) / "source.mp4"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(b"\x00" * 64)
+        return {"path": str(p), "title": "Test Video", "video_id": "abc123"}
+
+    monkeypatch.setattr(cli, "ytdl_download", mock_download)
+
+    return {"workdir": workdir, "monkeypatch": monkeypatch}
+
+
+def test_url_input_graph_receives_downloaded_path(url_env, monkeypatch):
+    """The graph_state['video_path'] points to the downloaded file, not the URL."""
+    captured_state = {}
+
+    class _StateGraph:
+        def __init__(self, cfg, timings=None):
+            pass
+        def invoke(self, state, config):
+            captured_state.update(state)
+            return {"output_path": "o", "srt_src": "a", "srt_target": "b"}
+
+    monkeypatch.setattr(cli, "build_graph", _StateGraph)
+    monkeypatch.setattr(
+        "sys.argv",
+        ["loro", "https://example.com/watch?v=abc123", "-w", str(url_env["workdir"])],
+    )
+    with pytest.raises(SystemExit):
+        cli.main()
+
+    assert captured_state["video_path"] != "https://example.com/watch?v=abc123"
+    assert "source.mp4" in captured_state["video_path"]
+
+
+def test_file_path_input_backward_compat_no_download(url_env, monkeypatch):
+    """File path input does not trigger download; video_path is unchanged."""
+    download_called = {"n": 0}
+
+    def mock_download(url, dest_dir, cfg=None):
+        download_called["n"] += 1
+        return {"path": "x", "title": "x", "video_id": "x"}
+
+    monkeypatch.setattr(cli, "ytdl_download", mock_download)
+
+    video_path = url_env["workdir"].parent / "local.mp4"
+    video_path.write_bytes(b"\x00" * 64)
+    class _Ok:
+        def __init__(self, cfg, timings=None):
+            pass
+        def invoke(self, state, config):
+            assert state["video_path"] == str(video_path)
+            return {"output_path": "o", "srt_src": "a", "srt_target": "b"}
+
+    monkeypatch.setattr(cli, "build_graph", _Ok)
+    monkeypatch.setattr(cli, "preflight", lambda cfg, video, wd: None)
+    monkeypatch.setattr(
+        "sys.argv", ["loro", str(video_path), "-w", str(url_env["workdir"])],
+    )
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+    assert exc.value.code == 0
+    assert download_called["n"] == 0
+
+
+def test_url_input_workdir_derived_from_url(tmp_path, monkeypatch):
+    """Without -w, the workdir is cfg.workdir / derive_workdir_stem(url)."""
+    from loro.utils.url import derive_workdir_stem
+
+    cfg_workdir = tmp_path / "cfgwork"
+    monkeypatch.setattr("loro.config.Config.workdir", cfg_workdir, raising=False)
+    # We need a Config whose .workdir returns cfg_workdir
+    # Simpler: patch the Config class
+
+    captured_state = {}
+
+    class _StateGraph:
+        def __init__(self, cfg, timings=None):
+            self.cfg = cfg
+        def invoke(self, state, config):
+            captured_state.update(state)
+            return {"output_path": "o", "srt_src": "a", "srt_target": "b"}
+
+    monkeypatch.setattr(cli, "build_graph", _StateGraph)
+    monkeypatch.setattr(cli, "preflight", lambda cfg, video, wd: None)
+    monkeypatch.setattr(
+        cli, "ytdl_download",
+        lambda url, dest_dir, cfg=None: {"path": str(dest_dir / "source.mp4"),
+                                         "title": "T", "video_id": "v"},
+    )
+    # Create the source.mp4 so preflight/pipeline doesn't choke on missing file
+    monkeypatch.setattr(
+        "sys.argv",
+        ["loro", "https://www.youtube.com/watch?v=l6KeLCuB90o"],
+    )
+
+    # Patch Config to return our tmp_path as workdir
+    import loro.config as config_mod
+    original_init = config_mod.Config.__init__
+
+    def patched_init(self, **kwargs):
+        original_init(self, **kwargs)
+        self.workdir = cfg_workdir
+    monkeypatch.setattr(config_mod.Config, "__init__", patched_init)
+
+    with pytest.raises(SystemExit):
+        cli.main()
+
+    expected_stem = derive_workdir_stem("https://www.youtube.com/watch?v=l6KeLCuB90o")
+    expected_workdir = str(cfg_workdir / expected_stem)
+    assert captured_state["workdir"] == expected_workdir
+
+
+def test_url_input_with_workdir_override(url_env, monkeypatch):
+    """With -w, the workdir is the override; download goes to workdir/ingest/."""
+    download_dest = {"dir": None}
+
+    def mock_download(url, dest_dir, cfg=None):
+        download_dest["dir"] = str(dest_dir)
+        p = Path(dest_dir) / "source.mp4"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(b"\x00" * 64)
+        return {"path": str(p), "title": "T", "video_id": "v"}
+
+    monkeypatch.setattr(cli, "ytdl_download", mock_download)
+
+    class _Ok:
+        def __init__(self, cfg, timings=None):
+            pass
+        def invoke(self, state, config):
+            return {"output_path": "o", "srt_src": "a", "srt_target": "b"}
+
+    monkeypatch.setattr(cli, "build_graph", _Ok)
+    custom_wd = url_env["workdir"]
+    monkeypatch.setattr(
+        "sys.argv", ["loro", "https://example.com/watch?v=abc123", "-w", str(custom_wd)],
+    )
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+    assert exc.value.code == 0
+    assert download_dest["dir"] == str(custom_wd / "ingest")
+
+
+def test_url_input_output_naming_from_title(url_env, monkeypatch):
+    """Without -o, URL input output defaults to workdir/sanitized_title.<tag>.mp4."""
+    captured_state = {}
+
+    class _StateGraph:
+        def __init__(self, cfg, timings=None):
+            self.cfg = cfg
+        def invoke(self, state, config):
+            captured_state.update(state)
+            return {"output_path": "o", "srt_src": "a", "srt_target": "b"}
+
+    monkeypatch.setattr(cli, "build_graph", _StateGraph)
+    monkeypatch.setattr(cli, "preflight", lambda cfg, video, wd: None)
+    monkeypatch.setattr(
+        cli, "ytdl_download",
+        lambda url, dest_dir, cfg=None: {"path": str(dest_dir / "source.mp4"),
+                                         "title": "My Cool Video", "video_id": "v1"},
+    )
+    monkeypatch.setattr(
+        "sys.argv",
+        ["loro", "https://example.com/watch?v=v1", "-w", str(url_env["workdir"])],
+    )
+    with pytest.raises(SystemExit):
+        cli.main()
+
+    # Output should be derived from title: workdir/My Cool Video.vi.mp4
+    expected = str(url_env["workdir"] / "My Cool Video.vi.mp4")
+    assert captured_state.get("output_path") == expected
+
+
+def test_url_input_output_falls_back_to_video_id(url_env, monkeypatch):
+    """Empty title falls back to video_id for output naming."""
+    captured_state = {}
+
+    class _StateGraph:
+        def __init__(self, cfg, timings=None):
+            self.cfg = cfg
+        def invoke(self, state, config):
+            captured_state.update(state)
+            return {"output_path": "o", "srt_src": "a", "srt_target": "b"}
+
+    monkeypatch.setattr(cli, "build_graph", _StateGraph)
+    monkeypatch.setattr(cli, "preflight", lambda cfg, video, wd: None)
+    monkeypatch.setattr(
+        cli, "ytdl_download",
+        lambda url, dest_dir, cfg=None: {"path": str(dest_dir / "source.mp4"),
+                                         "title": "", "video_id": "vid123"},
+    )
+    monkeypatch.setattr(
+        "sys.argv",
+        ["loro", "https://example.com/watch?v=vid123", "-w", str(url_env["workdir"])],
+    )
+    with pytest.raises(SystemExit):
+        cli.main()
+
+    expected = str(url_env["workdir"] / "vid123.vi.mp4")
+    assert captured_state.get("output_path") == expected
+
+
+def test_url_input_error_propagates_clearly(url_env, monkeypatch):
+    """Download error surfaces clearly and the pipeline does not start."""
+    pipeline_started = {"n": 0}
+
+    class _Graph:
+        def __init__(self, cfg, timings=None):
+            pass
+        def invoke(self, state, config):
+            pipeline_started["n"] += 1
+            return {}
+
+    monkeypatch.setattr(cli, "build_graph", _Graph)
+    monkeypatch.setattr(cli, "preflight", lambda cfg, video, wd: None)
+    monkeypatch.setattr(
+        cli, "ytdl_download",
+        lambda url, dest_dir, cfg=None: (_ for _ in ()).throw(
+            RuntimeError("Video unavailable")),
+    )
+    monkeypatch.setattr(
+        "sys.argv",
+        ["loro", "https://example.com/err", "-w", str(url_env["workdir"])],
+    )
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+    assert exc.value.code == 1
+    assert pipeline_started["n"] == 0  # pipeline never started
